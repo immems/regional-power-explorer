@@ -1,10 +1,11 @@
 import { useEffect, useRef, useState, useCallback } from 'react';
-import { useParams, Link } from 'react-router-dom';
+import { useParams, Link, useNavigate } from 'react-router-dom';
 import { track } from '../analytics';
 import maplibregl from 'maplibre-gl';
 import { useTheme } from '../App';
 import { getT, mapStyle, swapBasemap, toggleSatLabels, FUEL_COLORS, VOLTAGE_BRACKETS, kvFilterWithFloor, bracketFor, LINE_ATTR_LABELS, lineAttrText, linePopupHTML, visibleLineFeatures, linesToCSV, linesToDownloadGeoJSON, plantRadiusExpr, lcRadiusExpr, adaptiveMinMw, defaultNZones, PANEL_WIDTH_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, BRIEFS_ENABLED } from '../constants';
 import LayerPanel from '../components/LayerPanel';
+import MapChat from '../chat/MapChat';
 import CountryOverview from '../components/CountryOverview';
 import REResourcesTab from '../components/tabs/REResourcesTab';
 import LoadTab from '../components/tabs/LoadTab';
@@ -108,6 +109,7 @@ function fitBoundsCountry(iso, countries) {
 
 export default function CountryPage() {
   const { iso }      = useParams();
+  const navigate     = useNavigate();
   const { theme }    = useTheme();
   const t            = getT(theme);
 
@@ -1142,6 +1144,11 @@ export default function CountryPage() {
       onMouseUp={() => { isDrRef.current = false; }}
       onMouseLeave={() => { isDrRef.current = false; }}
     >
+      <MapChat mapRef={mapRef} mapKey={mapRef.current} ready={!!info} controller={{
+        page: 'country', iso, regionId: info.region?.id, tab: activeTab, navigate,
+        setTab: setActiveTab, setPlantSource, setMinMw: handleMinMw,
+        showOnlyFuels: fuels => { for (const f of presentFuels) if (fuelsOff.has(f) === fuels.includes(f)) toggleFuel(f); },
+      }} />
       {isMobile && layerPanelOpen && (
         <div onClick={() => setLayerPanelOpen(false)} style={{
           position: 'absolute', inset: 0, zIndex: 299, backgroundColor: 'rgba(0,0,0,0.35)',
