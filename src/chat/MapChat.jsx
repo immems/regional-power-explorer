@@ -32,6 +32,8 @@ Style
 - Be concise: highlight what matters and offer to go deeper rather than reproducing everything returned. Never paste raw JSON.
 - When you change the map or the dashboard, say in one line what you changed.`;
 
+const GREETING = 'Ask about capacity, generation, trade, access, tariffs, or tell me how to change the map.';
+
 function applyTheme(el, theme) {
   const t = getT(theme);
   el.setAttribute('theme', t.isDark ? 'dark' : 'light');
@@ -46,7 +48,8 @@ function applyTheme(el, theme) {
   };
   for (const [key, value] of Object.entries(tokens)) el.style.setProperty(`--${key}`, value);
   el.style.fontFamily = "'Open Sans', system-ui, sans-serif";
-  el.style.zoom = '0.86';
+  // No CSS zoom: Radix places the chat's popovers (settings, model menu) from
+  // unzoomed coordinates, so under a zoom they open far from their buttons.
 
   const panel = el.parentElement;
   const group = panel?.parentElement;
@@ -65,35 +68,87 @@ function applyTheme(el, theme) {
   const button = group?.querySelector('.imaps-ai-chat-toggle');
   if (button) Object.assign(button.style, { color: t.text, background: 'transparent' });
 
+  const gate = panel?.querySelector('.rpe-cairn-gate');
+  if (gate) {
+    Object.assign(gate.style, { background: t.panel, color: t.text });
+    gate.querySelector('header').style.borderBottom = `1px solid ${t.panelBorder}`;
+    for (const p of gate.querySelectorAll('.rpe-muted')) p.style.color = t.muted;
+    Object.assign(gate.querySelector('button').style, { background: t.highlight.fill, color: '#fff' });
+  }
   const bar = panel?.querySelector('.rpe-cairn-bar');
   if (bar) {
     Object.assign(bar.style, { borderBottom: `1px solid ${t.panelBorder}`, color: t.muted });
-    for (const b of bar.querySelectorAll('button')) Object.assign(b.style, { color: t.highlight.fill });
+    bar.querySelector('button').style.color = t.highlight.fill;
   }
 }
 
-// The Cairn gateway's sign-in bar, above the chat in its panel. It lives outside
-// the chat's shadow root, so the page's own font and theme apply (applyTheme).
-function cairnBar(panel) {
-  const bar = document.createElement('div');
-  bar.className = 'rpe-cairn-bar';
-  Object.assign(bar.style, {
-    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px',
-    padding: '6px 12px', fontSize: '12px', fontFamily: "'Open Sans', system-ui, sans-serif",
-  });
-  const text = document.createElement('span');
-  const action = document.createElement('button');
-  Object.assign(action.style, { border: 0, background: 'none', padding: 0, font: 'inherit', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' });
-  bar.append(text, action);
-  panel.prepend(bar);
+const FONT = "'Open Sans', system-ui, sans-serif";
+const CHAT_ICON = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M7.9 20A9 9 0 1 0 4 16.1L2 22Z"/></svg>';
 
-  /** Show the session (or its absence) and what the button does next. */
-  return (state) => {
-    text.textContent = state.message;
-    action.textContent = state.session ? 'Sign out' : 'Sign in';
-    action.onclick = () => (state.session ? cairnAuth.signOut() : cairnAuth.signIn()).catch(error => {
-      text.textContent = error?.message || 'Sign-in did not complete.';
-    });
+// MapLibre styles every button in a map control as a 29px square icon
+// (.maplibregl-ctrl button); ours are text buttons, so they undo that.
+const TEXT_BUTTON = { display: 'inline-block', width: 'auto', height: 'auto', lineHeight: 1.4, whiteSpace: 'nowrap' };
+
+const make = (tag, style = {}, text = '') => {
+  const node = document.createElement(tag);
+  Object.assign(node.style, style);
+  if (text) node.textContent = text;
+  return node;
+};
+
+// The Cairn gateway around the chat, in its panel and outside its shadow root,
+// so the page's font and theme apply (applyTheme). Signed out, the panel holds
+// only a sign-in card the chat's size; signed in, the chat with a slim line
+// above it naming the org and the user, and a sign-out link.
+function cairnGate(chat) {
+  const panel = chat.parentElement;
+
+  const gate = make('div', {
+    display: 'flex', flexDirection: 'column', width: chat.style.width, height: chat.style.height,
+    maxWidth: '100%', fontFamily: FONT, borderRadius: '8px', overflow: 'hidden',
+  });
+  gate.className = 'rpe-cairn-gate';
+  const header = make('header', { display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', fontSize: '15px', fontWeight: 700 });
+  header.innerHTML = CHAT_ICON;
+  header.append(make('span', {}, 'Power Explorer Assistant'));
+  const body = make('div', { padding: '14px', fontSize: '14px', lineHeight: 1.5 });
+  const intro = make('p', { margin: '0 0 12px' }, GREETING);
+  const why = make('p', { margin: '0 0 14px' }, 'The assistant runs on your organisation\'s AI service in Cairn, so it needs you to sign in.');
+  why.className = 'rpe-muted';
+  const action = make('button', {
+    ...TEXT_BUTTON, border: 0, borderRadius: '999px', padding: '6px 14px', font: `700 13px ${FONT}`, cursor: 'pointer',
+  });
+  const status = make('p', { margin: '12px 0 0', fontSize: '12px' });
+  status.className = 'rpe-muted';
+  status.setAttribute('role', 'status');
+  body.append(intro, why, action, status);
+  gate.append(header, body);
+
+  const bar = make('div', {
+    display: 'none', alignItems: 'center', justifyContent: 'space-between', gap: '8px',
+    padding: '6px 12px', fontSize: '12px', fontFamily: FONT,
+  });
+  bar.className = 'rpe-cairn-bar';
+  const who = make('span');
+  const signOut = make('button', { ...TEXT_BUTTON, border: 0, background: 'none', padding: 0, font: 'inherit', fontWeight: 600, cursor: 'pointer' }, 'Sign out');
+  signOut.onclick = () => cairnAuth.signOut();
+  bar.append(who, signOut);
+  panel.prepend(gate, bar);
+
+  const fail = error => { status.textContent = error?.message || 'Sign-in did not complete.'; };
+
+  /**
+   * `ready`: the chat is on the gateway (bar + chat). Otherwise the card: with
+   * no session it signs in; with one (connecting, or no endpoint) it signs out.
+   */
+  return ({ session, ready, message = '' }) => {
+    gate.style.display = ready ? 'none' : 'flex';
+    chat.style.display = ready ? '' : 'none';
+    bar.style.display = ready ? 'flex' : 'none';
+    who.textContent = ready ? message : '';
+    status.textContent = ready ? '' : message;
+    action.textContent = session ? 'Sign out' : 'Sign in with Cairn';
+    action.onclick = () => (session ? cairnAuth.signOut() : cairnAuth.signIn()).catch(fail);
   };
 }
 
@@ -135,11 +190,11 @@ export default function MapChat({ mapRef, ready, controller, theme }) {
         onExpandChange: open => { if (open) track('chat_open'); },
         chat: {
           title: 'Power Explorer Assistant',
-          greeting: 'Ask about capacity, generation, trade, access, tariffs, or tell me how to change the map.',
+          greeting: GREETING,
           placeholder: 'Ask about the power system…',
           systemPrompt: SYSTEM_PROMPT,
           defaultProvider: AI_PROVIDER,
-          disabledPlaceholder: cairnAuth ? 'Sign in above to use the assistant' : 'Loading dashboard data…',
+          disabledPlaceholder: cairnAuth ? 'Sign in with Cairn to use the assistant' : 'Loading dashboard data…',
           deployment: chatDeployment(),
           ...(cairnAuth ? { disabled: true } : {}),
         },
@@ -150,23 +205,23 @@ export default function MapChat({ mapRef, ready, controller, theme }) {
       if (cairnAuth) {
         // Through the Cairn gateway: no chat until the user is signed in and
         // has an endpoint; then the org's route, keyed by their token.
-        const el = ctrl.element;
-        const show = cairnBar(el.parentElement);
+        const chat = ctrl.element;
+        const show = cairnGate(chat);
         const follow = async session => {
           if (!session) {
-            el.props = { disabled: true, disabledPlaceholder: 'Sign in above to use the assistant' };
-            show({ session, message: 'Sign in to use the AI gateway.' });
+            chat.props = { disabled: true };
+            show({ session });
             return;
           }
           show({ session, message: `Connecting as ${sessionLabel(session)}…` });
           try {
             const deployment = await cairnDeployment(session, chatDeployment());
             if (disposed || cairnAuth.session?.token !== session.token) return;
-            el.props = { deployment, disabled: false };
-            show({ session, message: `${deployment.org?.name ?? 'AI gateway'} · ${sessionLabel(session)}` });
+            chat.props = { deployment, disabled: false };
+            show({ session, ready: true, message: `${deployment.org?.name ?? 'AI gateway'} · ${sessionLabel(session)}` });
           } catch (error) {
             if (disposed) return;
-            el.props = { disabled: true, disabledPlaceholder: 'No AI endpoint available' };
+            chat.props = { disabled: true };
             show({ session, message: error?.message || 'Could not reach the AI gateway.' });
           }
         };

@@ -19,7 +19,8 @@ const splitCsv = value => String(value || '')
 export function chatDeployment() {
   const provider = import.meta.env.VITE_AI_PROVIDER || 'anthropic';
   const baseUrl = import.meta.env.VITE_AI_GATEWAY_BASE_URL || '';
-  const allowUserKey = boolEnv(import.meta.env.VITE_AI_ALLOW_USER_KEY, !baseUrl);
+  // Behind a gateway (a fixed one, or Cairn's) users never paste a key of their own.
+  const allowUserKey = boolEnv(import.meta.env.VITE_AI_ALLOW_USER_KEY, !baseUrl && !import.meta.env.VITE_CAIRN_SERVER);
   // Without an allowlist the chat package starts on its fastest, least capable
   // model, which handles multi-tool data questions poorly. This one starts on
   // the first listed model the package knows; users can switch to the other.
@@ -27,7 +28,7 @@ export function chatDeployment() {
 
   const deployment = {
     storage: 'memory',
-    allowUserKey,
+    userKeys: allowUserKey ? 'always' : 'never',
     allowAttachments: false,
     showPricing: false,
     showToolCount: false,

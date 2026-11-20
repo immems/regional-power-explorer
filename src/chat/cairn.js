@@ -27,9 +27,16 @@ export async function cairnDeployment(session, base) {
   const endpoints = await fetchCairnEndpoints(CAIRN_SERVER, session.token);
   const endpoint = pickCairnEndpoint(endpoints, WANTED_ENDPOINT);
   if (!endpoint) throw new Error('Your account has no AI endpoint on this server. Ask its admin to add you to an organisation that has one.');
-  // The org's route is laid over `base` while the user is on it; `base` stays
-  // what their own key gets, where the org lets them switch to one.
-  return { ...base, ...cairnEndpoint(CAIRN_SERVER, session.token, endpoint, endpoints) };
+  const routed = cairnEndpoint(CAIRN_SERVER, session.token, endpoint, endpoints);
+  // Start on a strong model, not ai-chat's cheapest: the first of the app's
+  // preferred ids (base.allowModels, by prefix: claude-opus-5 → claude-opus-5-5)
+  // the endpoint serves, else the endpoint's first. The user can still switch.
+  const ids = endpoint.models.map(m => m.id);
+  const start = (base.allowModels ?? []).map(p => ids.find(id => id.startsWith(p))).find(Boolean) ?? ids[0];
+  if (start) routed.org.policy.defaultModels = { [endpoint.provider]: start };
+  // Only the org's route: this app never offers the user's own key, whatever
+  // the org would allow.
+  return { ...base, ...routed, userKeys: 'never' };
 }
 
 export const sessionLabel = session => session?.user?.name || session?.user?.email || 'signed in';
