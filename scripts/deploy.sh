@@ -29,6 +29,9 @@ HOST_PATH="wb-regional-power-explorer"
 # Public URL prefix the app is served under. Passed to Vite so hashed assets
 # and index.html resolve under the subfolder instead of the domain root.
 BASE_PATH="/$HOST_PATH/"
+# The assistant's models go through the AI gateway on this Cairn server: users
+# sign in with it, and it adds the org's provider credential server-side.
+export VITE_CAIRN_SERVER="${VITE_CAIRN_SERVER:-https://wb-sandbox.internationalmapping.com}"
 
 APP_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 cd "$APP_DIR" || print_error "$APP_DIR not found!"

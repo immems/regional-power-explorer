@@ -5,6 +5,7 @@ import { useLocalServer } from './useLocalServer';
 import { buildDataServer } from './dataServer';
 import { buildAppControlServer, useAppController } from './appControl';
 import { AI_PROVIDER, chatDeployment } from './config';
+import { cairnAuth, cairnDeployment, sessionLabel } from './cairn';
 
 // The assistant's standing instructions: who it serves, what the data is, and how
 // to answer. Rules about one tool belong in that tool's description
@@ -63,6 +64,37 @@ function applyTheme(el, theme) {
   });
   const button = group?.querySelector('.imaps-ai-chat-toggle');
   if (button) Object.assign(button.style, { color: t.text, background: 'transparent' });
+
+  const bar = panel?.querySelector('.rpe-cairn-bar');
+  if (bar) {
+    Object.assign(bar.style, { borderBottom: `1px solid ${t.panelBorder}`, color: t.muted });
+    for (const b of bar.querySelectorAll('button')) Object.assign(b.style, { color: t.highlight.fill });
+  }
+}
+
+// The Cairn gateway's sign-in bar, above the chat in its panel. It lives outside
+// the chat's shadow root, so the page's own font and theme apply (applyTheme).
+function cairnBar(panel) {
+  const bar = document.createElement('div');
+  bar.className = 'rpe-cairn-bar';
+  Object.assign(bar.style, {
+    display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: '8px',
+    padding: '6px 12px', fontSize: '12px', fontFamily: "'Open Sans', system-ui, sans-serif",
+  });
+  const text = document.createElement('span');
+  const action = document.createElement('button');
+  Object.assign(action.style, { border: 0, background: 'none', padding: 0, font: 'inherit', fontWeight: 600, cursor: 'pointer', whiteSpace: 'nowrap' });
+  bar.append(text, action);
+  panel.prepend(bar);
+
+  /** Show the session (or its absence) and what the button does next. */
+  return (state) => {
+    text.textContent = state.message;
+    action.textContent = state.session ? 'Sign out' : 'Sign in';
+    action.onclick = () => (state.session ? cairnAuth.signOut() : cairnAuth.signIn()).catch(error => {
+      text.textContent = error?.message || 'Sign-in did not complete.';
+    });
+  };
 }
 
 export default function MapChat({ mapRef, ready, controller, theme }) {
@@ -82,6 +114,7 @@ export default function MapChat({ mapRef, ready, controller, theme }) {
 
     let disposed = false;
     let ctrl = null;
+    let unsubscribe = null;
 
     (async () => {
       // Keep the alpha chat UI out of the critical dashboard bundle. The MCP
@@ -106,13 +139,40 @@ export default function MapChat({ mapRef, ready, controller, theme }) {
           placeholder: 'Ask about the power system…',
           systemPrompt: SYSTEM_PROMPT,
           defaultProvider: AI_PROVIDER,
-          disabledPlaceholder: 'Loading dashboard data…',
+          disabledPlaceholder: cairnAuth ? 'Sign in above to use the assistant' : 'Loading dashboard data…',
           deployment: chatDeployment(),
+          ...(cairnAuth ? { disabled: true } : {}),
         },
       });
       ctrl.localServers = serversRef.current;
       map.addControl(ctrl, 'bottom-right');
       controlRef.current = ctrl;
+      if (cairnAuth) {
+        // Through the Cairn gateway: no chat until the user is signed in and
+        // has an endpoint; then the org's route, keyed by their token.
+        const el = ctrl.element;
+        const show = cairnBar(el.parentElement);
+        const follow = async session => {
+          if (!session) {
+            el.props = { disabled: true, disabledPlaceholder: 'Sign in above to use the assistant' };
+            show({ session, message: 'Sign in to use the AI gateway.' });
+            return;
+          }
+          show({ session, message: `Connecting as ${sessionLabel(session)}…` });
+          try {
+            const deployment = await cairnDeployment(session, chatDeployment());
+            if (disposed || cairnAuth.session?.token !== session.token) return;
+            el.props = { deployment, disabled: false };
+            show({ session, message: `${deployment.org?.name ?? 'AI gateway'} · ${sessionLabel(session)}` });
+          } catch (error) {
+            if (disposed) return;
+            el.props = { disabled: true, disabledPlaceholder: 'No AI endpoint available' };
+            show({ session, message: error?.message || 'Could not reach the AI gateway.' });
+          }
+        };
+        unsubscribe = cairnAuth.subscribe(follow);
+        follow(cairnAuth.session);
+      }
       applyTheme(ctrl.element, theme);
       // One chat_message per question: the status leaves idle as a turn starts.
       // The question itself is not sent; the panel shows in session replays.
@@ -128,6 +188,7 @@ export default function MapChat({ mapRef, ready, controller, theme }) {
 
     return () => {
       disposed = true;
+      unsubscribe?.();
       if (!ctrl) return;
       try { if (map.hasControl(ctrl)) map.removeControl(ctrl); } catch { /* map teardown */ }
       if (controlRef.current === ctrl) controlRef.current = null;

@@ -1,5 +1,6 @@
 import { defineConfig } from 'vite'
 import react from '@vitejs/plugin-react'
+import tailwindcss from '@tailwindcss/vite'
 import fs from 'node:fs'
 import path from 'node:path'
 import process from 'node:process'
@@ -61,5 +62,8 @@ function dataManifest() {
 // https://vite.dev/config/
 export default defineConfig({
   base: BASE,
-  plugins: [react(), iisConfig(), dataManifest()],
+  // Tailwind compiles @imaps/ai-chat's own stylesheet (the workspace package
+  // ships source, and its chat element adopts that sheet in its shadow root).
+  // The app's CSS has no Tailwind directives, so nothing of the app changes.
+  plugins: [react(), tailwindcss(), iisConfig(), dataManifest()],
 })
