@@ -34,6 +34,14 @@ Style
 
 const GREETING = 'Ask about capacity, generation, trade, access, tariffs, or tell me how to change the map.';
 
+// The chat at the app's type size: Tailwind v4 derives padding, gaps, icon
+// sizes (--spacing) and type (--text-*) from these, in rem.
+const CHAT_SCALE = 0.86;
+const CHAT_SIZES = {
+  spacing: 0.25, 'text-xs': 0.75, 'text-sm': 0.875, 'text-base': 1, 'text-lg': 1.125,
+  'text-xl': 1.25, 'text-2xl': 1.5, 'text-3xl': 1.875, 'text-4xl': 2.25, 'text-6xl': 3.75,
+};
+
 function applyTheme(el, theme) {
   const t = getT(theme);
   el.setAttribute('theme', t.isDark ? 'dark' : 'light');
@@ -48,8 +56,11 @@ function applyTheme(el, theme) {
   };
   for (const [key, value] of Object.entries(tokens)) el.style.setProperty(`--${key}`, value);
   el.style.fontFamily = "'Open Sans', system-ui, sans-serif";
-  // No CSS zoom: Radix places the chat's popovers (settings, model menu) from
-  // unzoomed coordinates, so under a zoom they open far from their buttons.
+  // Scaled to the app's type size through Tailwind's theme variables, not CSS
+  // zoom: under a zoom Radix places the chat's popovers (settings, model menu)
+  // from unzoomed coordinates, far from their buttons. Custom properties set on
+  // the host beat the shadow sheet's own `:host` defaults and inherit into it.
+  for (const [name, rem] of Object.entries(CHAT_SIZES)) el.style.setProperty(`--${name}`, `${(rem * CHAT_SCALE).toFixed(4)}rem`);
 
   const panel = el.parentElement;
   const group = panel?.parentElement;
@@ -108,17 +119,17 @@ function cairnGate(chat) {
     maxWidth: '100%', fontFamily: FONT, borderRadius: '8px', overflow: 'hidden',
   });
   gate.className = 'rpe-cairn-gate';
-  const header = make('header', { display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 14px', fontSize: '15px', fontWeight: 700 });
+  const header = make('header', { display: 'flex', alignItems: 'center', gap: '8px', padding: '10px 12px', fontSize: '14px', fontWeight: 700 });
   header.innerHTML = CHAT_ICON;
   header.append(make('span', {}, 'Power Explorer Assistant'));
-  const body = make('div', { padding: '14px', fontSize: '14px', lineHeight: 1.5 });
+  const body = make('div', { padding: '12px', fontSize: '13px', lineHeight: 1.5 });
   const intro = make('p', { margin: '0 0 12px' }, GREETING);
   const why = make('p', { margin: '0 0 14px' }, 'The assistant runs on your organisation\'s AI service in Cairn, so it needs you to sign in.');
   why.className = 'rpe-muted';
   const action = make('button', {
-    ...TEXT_BUTTON, border: 0, borderRadius: '999px', padding: '6px 14px', font: `700 13px ${FONT}`, cursor: 'pointer',
+    ...TEXT_BUTTON, border: 0, borderRadius: '999px', padding: '5px 13px', font: `700 12px ${FONT}`, cursor: 'pointer',
   });
-  const status = make('p', { margin: '12px 0 0', fontSize: '12px' });
+  const status = make('p', { margin: '10px 0 0', fontSize: '11px' });
   status.className = 'rpe-muted';
   status.setAttribute('role', 'status');
   body.append(intro, why, action, status);
