@@ -1,40 +1,29 @@
+import { dataPath } from '../utils/paths';
+import { fetchData } from '../utils/dataCache';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, useNavigate, Link } from 'react-router-dom';
 import { track } from '../analytics';
 import maplibregl from 'maplibre-gl';
+import { Protocol, PMTiles } from 'pmtiles';
 import { useTheme } from '../App';
 import {
-  getT, mapStyle, swapBasemap, toggleSatLabels, FUEL_COLORS, VOLTAGE_BRACKETS, kvFilterWithFloor, bracketFor, LINE_ATTR_LABELS, lineAttrText, linePopupHTML, visibleLineFeatures, linesToCSV, linesToDownloadGeoJSON,
-  plantRadiusExpr, lcRadiusExpr, fuelColorExpr, PLANT_STATUSES, zoneColorExpr, adaptiveMinMw,
+  getT, FUEL_COLORS, VOLTAGE_BRACKETS, kvFilterWithFloor, bracketFor, linePopupHTML, visibleLineFeatures, linesToCSV, linesToDownloadGeoJSON,
+  plantRadiusExpr, lcRadiusExpr, PLANT_CIRCLE_SCALE, fuelColorExpr, PLANT_STATUSES, zoneColorExpr, adaptiveMinMw,
   PANEL_WIDTH_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX,
 } from '../constants';
 import LayerPanel from '../components/LayerPanel';
-import MapChat from '../chat/MapChat';
+import MapChat from '../chat/LazyMapChat';
+import ExportControl from '../components/ExportControl';
+import WorldButton from '../components/WorldButton';
+import { powerLegend } from '../utils/exportLegend';
 import CapacityChart from '../components/CapacityChart';
 import StatsPanel from '../components/StatsPanel';
 import RegionSupplyTrade from '../components/RegionSupplyTrade';
 import MetaRegionPage from './MetaRegionPage';
-import { fetchCountries, fetchBoundaries, addCountriesSource, addBaseLayers, regionFilter, addRegionCoast, raiseBoundaries } from '../utils/basemap';
+import { buildWbStyle, applyWbView, useWbStyleBase, DEFAULT_WB_VIEW, MAP_LABEL_FONT } from '../utils/wbStyle';
+import { fetchBboxes, fetchNdlsa, boundsFor, prefetchGeo, addGeoSource, countryLayer, featureTarget, regionFilter, addNdlsaLayer, raiseBoundaries, fillAnchor } from '../utils/basemap';
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
-
-function fitBounds(isos, countries) {
-  let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
-  for (const f of countries.features) {
-    if (!isos.includes(f.properties.ISO_A3)) continue;
-    const geom = f.geometry;
-    const rings = geom.type === 'Polygon'
-      ? geom.coordinates
-      : geom.coordinates.flatMap(p => p);
-    for (const ring of rings)
-      for (const [lon, lat] of ring) {
-        if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon;
-        if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
-      }
-  }
-  if (!isFinite(minLon)) return null;
-  return [[minLon - 0.5, minLat - 0.5], [maxLon + 0.5, maxLat + 0.5]];
-}
 
 /** Build the MapLibre filter for a status layer, respecting fuel/country visibility and minMw. */
 function makeLayerFilter(status, fuelsOff, minMw, visibleIsos = null) {
@@ -49,15 +38,13 @@ function makeLayerFilter(status, fuelsOff, minMw, visibleIsos = null) {
   return ['all', ...clauses];
 }
 
-function lineKm(coords) {
-  let km = 0;
-  for (let i = 1; i < coords.length; i++) {
-    const [lon1, lat1] = coords[i - 1], [lon2, lat2] = coords[i];
-    const R = 6371, dLat = (lat2 - lat1) * Math.PI / 180, dLon = (lon2 - lon1) * Math.PI / 180;
-    const a = Math.sin(dLat/2)**2 + Math.cos(lat1*Math.PI/180) * Math.cos(lat2*Math.PI/180) * Math.sin(dLon/2)**2;
-    km += R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-  }
-  return km;
+/** A line's two ends. A tile holds only its piece of the line, so a tiled
+ *  line's true ends come from its attributes, x0 y0 x1 y1. */
+function lineEnds(p, feat) {
+  if (p.x0 != null) return [[p.x0, p.y0], [p.x1, p.y1]];
+  const g = feat.geometry;
+  const coords = g.type === 'LineString' ? g.coordinates : g.coordinates.flat();
+  return [coords[0], coords[coords.length - 1]];
 }
 
 function downloadBlob(content, filename, type = 'application/octet-stream') {
@@ -75,6 +62,103 @@ function Row({ label, value, t }) {
       <span style={{ color: t.lbl, fontWeight:600, textAlign:'right' }}>{value}</span>
     </div>
   );
+}
+
+// Map layers behind each corridor toggle.
+const CORRIDOR_LAYERS = {
+  Existing:  ['region-corridors-ex', 'region-corridors-labels', 'region-corridors-dots'],
+  Committed: ['region-corridors-committed', 'region-corridors-dots'],
+  Candidate: ['region-corridors-candidate', 'region-corridors-dots'],
+};
+
+// What the page needs to know about its plant and line files without reading
+// them: written by tools/prepare_region_summary.py. With it the big files go to
+// MapLibre by URL and are parsed in its worker; Europe's lines are 21 MB, and
+// reading them here and copying them to the worker froze the page for about
+// a second on a desktop. Without one (a region not yet summarised) the page
+// reads the files itself, as before.
+const fetchSummary = regionId => fetchData(dataPath(`cache/region_summary_${regionId}.json`)).catch(() => null);
+const SOURCE_KEY = { '': 'osm', _gppd: 'gppd', _gem: 'gem' };
+const SOURCE_SUFFIX = { osm: '', gppd: '_gppd', gem: '_gem' };
+const absUrl = path => new URL(path, window.location.href).href;
+
+// Download a file the map will fetch for itself, so the browser has it to
+// hand; the bytes are kept, never parsed.
+function warm(path) {
+  fetch(path).then(r => (r.ok ? r.arrayBuffer() : null)).catch(() => {});
+}
+
+/** Default min-MW, fuels present and plant count, from a summary or a parsed file. */
+function plantFacts(facts, fc) {
+  const mws = facts ? facts.top_mw : fc.features.map(f => f.properties.mw || 0);
+  return {
+    // Cap the map to the ~150 largest plants, 0 if fewer.
+    adaptMin: adaptiveMinMw(mws.map(mw => ({ properties: { mw } })), 150),
+    fuels: new Set((facts ? facts.fuels : fc.features.map(f => f.properties.fuel)).filter(f => FUEL_COLORS[f])),
+    count: facts ? facts.count : fc.features.length,
+  };
+}
+
+// Vector tiles of a region's lines (tools/prepare_line_tiles.py), one layer
+// "lines", read straight from a static .pmtiles file by range requests.
+const linesTiles = regionId => absUrl(dataPath(`tiles/region_lines_${regionId}.pmtiles`));
+// The rest of each tiled line, row n-1 for feature id n: name, operator,
+// length, ends... -- kept out of the tiles, which they made 4x larger.
+const linesAttrs = regionId => dataPath(`tiles/region_lines_${regionId}_attrs.json`);
+function attrsProps(attrs, feat) {
+  const row = attrs.rows[feat.id - 1] || [];
+  const p = { v: feat.properties.v };
+  attrs.keys.forEach((k, i) => { if (row[i] != null) p[k] = row[i]; });
+  return p;
+}
+let protocol = null;
+function pmtilesProtocol() {
+  if (!protocol) {
+    protocol = new Protocol();
+    maplibregl.addProtocol('pmtiles', protocol.tile);
+  }
+  return protocol;
+}
+// Read a tile file's header and directory now, so that once the map asks for
+// tiles it waits on the tiles alone and not on two round trips before them.
+function warmTiles(url) {
+  const p = pmtilesProtocol();
+  if (!p.get(url)) p.add(new PMTiles(url));
+  p.get(url).getHeader().catch(() => {});
+}
+
+// A big file's first pass: what the map shows at first, cut from it by
+// tools/prepare_region_summary.py. The summary flags the ones that exist.
+const firstPass = file => file.replace('.geojson', '_first.geojson');
+
+// Draw a source's first-pass file, then swap in the full one once that is on
+// screen. Sent together, the full file would hold up the worker drawing the
+// first. A first pass that fails to load still ends in the full file.
+// keep() is asked before the swap; false skips it.
+async function setDataInStages(map, id, first, full, keep) {
+  await map.getSource(id)?.setData(first, true);
+  await new Promise(resolve => {
+    const drawn = () => {
+      if (!map.getSource(id) || !map.isSourceLoaded(id)) return;
+      map.off('sourcedata', drawn);
+      map.off('idle', drawn);
+      resolve();
+    };
+    map.on('sourcedata', drawn);
+    map.on('idle', drawn);
+    drawn();
+  });
+  if (keep()) map.getSource(id)?.setData(full);
+}
+
+// The region's map data files, in the order the map handler reads them.
+function regionDataFiles(regionId) {
+  return [
+    `cache/region_plants_${regionId}.geojson`,
+    `cache/region_lines_${regionId}.geojson`,
+    `cache/region_substations_${regionId}.geojson`,
+    `region_load_centers_${regionId}.geojson`,
+  ];
 }
 
 // ── Component ────────────────────────────────────────────────────────────────
@@ -112,14 +196,18 @@ export default function RegionPage() {
   const [minKv,            setMinKv]            = useState(0);
   const [kvFloor,          setKvFloor]          = useState(110);
   const [presentKvs,       setPresentKvs]       = useState(null);
-  const [circleScale,     setCircleScale]     = useState(1.0);
+  const [circleScale,     setCircleScale]     = useState(PLANT_CIRCLE_SCALE);
   const [plantSource,     setPlantSource]     = useState('gem');
+  const plantSourceRef = useRef(plantSource); // what a rebuilt map starts on
+  plantSourceRef.current = plantSource;
+  const plantsShownRef = useRef(null);        // the source in the map's 'plants'
   const [mapReady,        setMapReady]        = useState(false);
   const [panelWidth,      setPanelWidth]      = useState(PANEL_WIDTH_DEFAULT);
   const [selFeature,      setSelFeature]      = useState(null);
   const [activeTab,       setActiveTab]       = useState('overview');
-  const [basemap,         setBasemap]         = useState('minimal');
-  const [satLabels,       setSatLabels]       = useState(false);
+  const [wbView,          setWbView]          = useState(DEFAULT_WB_VIEW);
+  const wbViewRef = useRef(wbView);   // what a rebuilt map (theme change) starts from
+  const wbBase = useWbStyleBase();
   const [mapMode,         setMapMode]         = useState('countries');
   const [zonesAvailable,  setZonesAvailable]  = useState(false);
   const [corrExistOn,     setCorrExistOn]     = useState(false);
@@ -135,6 +223,28 @@ export default function RegionPage() {
   const [sheetHeight,     setSheetHeight]     = useState(96);
   const [isDragging,      setIsDragging]      = useState(false);
   const dragRef = useRef(null);
+
+  useEffect(() => {
+    prefetchGeo('region', regionId);
+    // Start the map data now, alongside the basemap. Plants and lines go to the
+    // map by URL when the region has a summary, so they are only warmed in the
+    // browser's cache -- the files drawn first, which for a big region is its
+    // first pass; the small files go through the data cache.
+    const [plantsFile, linesFile, subsFile, lcFile] = regionDataFiles(regionId);
+    fetchSummary(regionId).then(summary => {
+      if (!summary) {
+        for (const p of [plantsFile, linesFile]) fetchData(dataPath(p)).catch(() => {});
+        return;
+      }
+      const source = summary.plants[plantSourceRef.current] ? plantSourceRef.current : 'osm';
+      const plants = `cache/region_plants_${regionId}${SOURCE_SUFFIX[source]}.geojson`;
+      warm(dataPath(summary.plants[source]?.first ? firstPass(plants) : plants));
+      // Tiled lines fetch only the tiles in view; their header comes now.
+      if (summary.lines?.tiles) warmTiles(linesTiles(regionId));
+      else warm(dataPath(summary.lines?.first ? firstPass(linesFile) : linesFile));
+    });
+    for (const p of [subsFile, lcFile]) fetchData(dataPath(p)).catch(() => {});
+  }, [regionId]);
 
   useEffect(() => {
     const handler = () => setIsMobile(window.innerWidth < 700);
@@ -175,22 +285,22 @@ export default function RegionPage() {
 
   // Static data
   useEffect(() => {
-    fetch('/data/tariffs.json').then(r => r.json()).then(setTariffs).catch(() => {});
-    fetch('/data/access.json').then(r => r.json()).then(setAccess).catch(() => {});
+    fetchData(dataPath('tariffs.json')).then(setTariffs).catch(() => {});
+    fetchData(dataPath('access.json')).then(setAccess).catch(() => {});
   }, []);
 
   // Region metadata + availability checks
   useEffect(() => {
-    fetch('/data/regions.json').then(r => r.json()).then(d => {
+    fetchData(dataPath('regions.json')).then(d => {
       const r = (d.regions || []).find(r => r.id === regionId);
       setRegion(r || null);
     });
     setCapacity(null); setFleetAge(null);
-    fetch(`/data/cache/region_capacity_${regionId}.json`).then(r => r.json()).then(setCapacity).catch(() => {});
+    fetchData(dataPath(`cache/region_capacity_${regionId}.json`)).then(setCapacity).catch(() => {});
     setFuelsOff(new Set()); setStatusOff(new Set()); setKvsOff(new Set());
     setLinesOn(true); setPlantsOn(true); setSubsOn(false);
     setLoadCentersOn(false); setLcMinPop(300_000); setLcCircleScale(1.0);
-    setMinMw(100); setCircleScale(1.0);
+    setMinMw(100); setCircleScale(PLANT_CIRCLE_SCALE);
     setPlantSource('gem'); setActiveTab('overview');
     track('region_view', { region: regionId });
 
@@ -198,8 +308,7 @@ export default function RegionPage() {
     setCorrExistOn(false); setCorrCommOn(false); setCorrCandOn(false);
     setZoningConfigs([]); setSelectedSlug(null);
     setCountriesOff(new Set()); setPlantCount(null);
-    fetch(`/data/zones/${regionId}_configs.json`)
-      .then(r => r.ok ? r.json() : null)
+    fetchData(dataPath(`zones/${regionId}_configs.json`)).catch(() => null)
       .then(cfgs => {
         if (cfgs?.length) {
           setZoningConfigs(cfgs);
@@ -210,11 +319,11 @@ export default function RegionPage() {
       .catch(() => {});
 
     setGppdAvailable(null);
-    fetch(`/data/cache/region_plants_${regionId}_gppd.geojson`, { method: 'HEAD' })
+    fetch(dataPath(`cache/region_plants_${regionId}_gppd.geojson`), { method: 'HEAD' })
       .then(r => setGppdAvailable(r.ok)).catch(() => setGppdAvailable(false));
 
     setGemAvailable(null);
-    fetch(`/data/cache/region_plants_${regionId}_gem.geojson`, { method: 'HEAD' })
+    fetch(dataPath(`cache/region_plants_${regionId}_gem.geojson`), { method: 'HEAD' })
       .then(r => setGemAvailable(r.ok)).catch(() => setGemAvailable(false));
   }, [regionId]);
 
@@ -222,15 +331,17 @@ export default function RegionPage() {
   useEffect(() => {
     setFleetAge(null);
     if (plantSource !== 'gppd') return;
-    fetch(`/data/cache/region_age_${regionId}_gppd.json`)
-      .then(r => r.ok ? r.json() : null).then(setFleetAge).catch(() => {});
+    fetchData(dataPath(`cache/region_age_${regionId}_gppd.json`)).catch(() => null).then(setFleetAge).catch(() => {});
   }, [plantSource, regionId]);
 
   // Plant count for overview stats
   useEffect(() => {
     const suffix = plantSource === 'gppd' ? '_gppd' : plantSource === 'gem' ? '_gem' : '';
-    fetch(`/data/cache/region_plants_${regionId}${suffix}.geojson`)
-      .then(r => r.json()).then(d => setPlantCount(d.features.length)).catch(() => {});
+    fetchSummary(regionId).then(async summary => {
+      const facts = summary?.plants?.[SOURCE_KEY[suffix]];
+      const fc = facts ? null : await fetchData(dataPath(`cache/region_plants_${regionId}${suffix}.geojson`));
+      setPlantCount(plantFacts(facts, fc).count);
+    }).catch(() => {});
   }, [regionId, plantSource]);
 
   // R1 — cross-border integration snapshot (built from per-country trade files)
@@ -240,7 +351,7 @@ export default function RegionPage() {
     let cancelled = false;
     const isos = region.countries.map(c => c.iso);
     Promise.all(isos.map(iso =>
-      fetch(`/data/trade/${iso}.json`).then(r => (r.ok ? r.json() : null)).catch(() => null),
+      fetchData(dataPath(`trade/${iso}.json`)).catch(() => null),
     )).then(results => {
       if (cancelled) return;
       let withData = 0, isolated = 0, netExp = 0, netImp = 0, tradedGwh = 0, tradeYear = null;
@@ -280,75 +391,68 @@ export default function RegionPage() {
     for (const s of PLANT_STATUSES)
       if (map.getLayer(`plants-${s}`))
         map.setFilter(`plants-${s}`, makeLayerFilter(s, fuelsOff, minMw, visibleIsos));
-  }, [countriesOff, fuelsOff, minMw, region]); // eslint-disable-line
+  }, [countriesOff, fuelsOff, minMw, region]);
 
   // Map initialisation
   useEffect(() => {
-    if (!containerRef.current || !region) return;
+    if (!containerRef.current || !region || !wbBase) return;
 
     const isos = region.countries.map(c => c.iso);
+    const tv = getT(theme);
 
+    let disposed = false;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: mapStyle(theme),
+      style: buildWbStyle(wbBase, tv, wbViewRef.current),
       center: [0, 20], zoom: 2, minZoom: 1, maxZoom: 14,
       attributionControl: false,
     });
     mapRef.current = map;
+    // Frame the region as soon as the (small, cached) bbox file is in, not
+    // after the style and every data layer have loaded -- otherwise the page
+    // sits on the zoom-2 world view for the whole download.
+    fetchBboxes().then(bboxes => {
+      const bounds = boundsFor(bboxes, 'regions', regionId, 0.5);
+      if (!disposed && bounds) map.fitBounds(bounds, { padding: 40, duration: 0 });
+    }).catch(err => console.error('bboxes', err));
 
     const popup = new maplibregl.Popup({
       closeButton: false, closeOnClick: false, offset: 10,
       className: `popup-${theme}`,
     });
 
-    map.on('load', async () => {
-      const [countries, boundaries, plantsGJ, linesGJ, subsGJ, lcGJ] = await Promise.all([
-        fetchCountries('10m'),
-        fetchBoundaries('10m'),
-        fetch(`/data/cache/region_plants_${regionId}.geojson`).then(r => r.json()),
-        fetch(`/data/cache/region_lines_${regionId}.geojson`).then(r => r.json()),
-        fetch(`/data/cache/region_substations_${regionId}.geojson`)
-          .then(r => r.json()).catch(() => ({ type: 'FeatureCollection', features: [] })),
-        fetch(`/data/region_load_centers_${regionId}.geojson`)
-          .then(r => r.json()).catch(() => ({ type: 'FeatureCollection', features: [] })),
+    // On the style, not 'load': 'load' waits for every basemap tile and font to
+    // arrive and draw. The region's colours go on as soon as its geometry is in;
+    // plants, lines, substations and load centres start empty and fill in as
+    // each file arrives (see the end of this handler), so the largest file --
+    // Europe's lines, 21 MB -- holds up nothing but its own layer.
+    map.once('style.load', async () => {
+      const [mode, ndlsa, summary] = await Promise.all([
+        addGeoSource(map, 'region', regionId, () => disposed),
+        fetchNdlsa(),
+        fetchSummary(regionId),
       ]);
 
-      const bounds = fitBounds(isos, countries);
-      if (bounds) map.fitBounds(bounds, { padding: 40, duration: 0 });
+      if (disposed || !mode) return;
 
-      // Adaptive default min-MW: cap to the ~150 largest plants, 0 if fewer.
-      const adaptMin = adaptiveMinMw(plantsGJ.features, 150);
-      setMinMw(adaptMin);
-      // Slider floor comes from the data itself: regions.yaml sets a different
-      // min_kv per region, and this way the UI never promises voltages the file
-      // doesn't hold.
-      const taggedKv = linesGJ.features
-        .map(f => f.properties.v)
-        .filter(v => v > 0);
-      const floorKv = taggedKv.length ? Math.floor(Math.min(...taggedKv) / 1000) : 110;
-      setKvFloor(floorKv);
-      // A theme switch rebuilds the map from scratch; keep whatever the slider
-      // was set to as long as the new data can honour it, and only fall back to
-      // the floor when it can't (first load, or a region with a higher floor).
-      setMinKv(kv => (kv >= floorKv && kv <= 500 ? kv : floorKv));
-      // Regions with a 110 kV floor hold no 33-110 kV and no untagged lines;
-      // an empty legend row would just be a dead checkbox.
-      setPresentKvs(new Set(linesGJ.features.map(f => bracketFor(f.properties.v).key)));
-
-      addCountriesSource(map, countries);
-      map.addSource('plants',       { type: 'geojson', data: plantsGJ });
-      map.addSource('lines',        { type: 'geojson', data: linesGJ  });
-      map.addSource('substations',  { type: 'geojson', data: subsGJ   });
-      map.addSource('load-centers', { type: 'geojson', data: lcGJ     });
-
-      const tv = getT(theme);
-      addBaseLayers(map, tv, boundaries);
+      const hl = tv.highlight;
+      const empty = () => ({ type: 'FeatureCollection', features: [] });
+      map.addSource('plants',       { type: 'geojson', data: empty() });
+      // Tiled lines load the tiles in view; the rest come as one file below.
+      const tiled = !!summary?.lines?.tiles;
+      if (tiled) {
+        pmtilesProtocol();
+        map.addSource('lines', { type: 'vector', url: `pmtiles://${linesTiles(regionId)}` });
+      } else map.addSource('lines', { type: 'geojson', data: empty() });
+      map.addSource('substations',  { type: 'geojson', data: empty() });
+      map.addSource('load-centers', { type: 'geojson', data: empty() });
 
 
       // Transmission lines
       for (const bracket of VOLTAGE_BRACKETS) {
         const { colors, width, key } = bracket;
         map.addLayer({ id: `lines-${key}`, type: 'line', source: 'lines',
+          ...(tiled && { 'source-layer': 'lines' }),
           filter: kvFilterWithFloor(bracket, minKv),
           paint: { 'line-color': colors[theme] ?? colors.fog, 'line-width': width,
             'line-opacity': tv.isDark ? 0.92 : 0.65 } });
@@ -356,16 +460,16 @@ export default function RegionPage() {
 
 
       // Region highlight
-      const hl = tv.highlight;
-      map.addLayer({ id: 'region-fill', type: 'fill', source: 'countries',
-        filter: regionFilter(isos, region.non_determined),
+      map.addLayer({ id: 'region-fill', type: 'fill', ...countryLayer(mode),
+        filter: regionFilter(isos),
         paint: { 'fill-color': hl.fill,
-          'fill-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.18, 0.08] } });
-      map.addLayer({ id: 'region-border', type: 'line', source: 'countries',
-        filter: ['in', ['get', 'ISO_A3'], ['literal', isos]],
-        paint: { 'line-color': hl.border, 'line-width': hl.borderW, 'line-opacity': 0.9 } });
-      addRegionCoast(map, { areas: region.non_determined, color: hl.border,
-        width: hl.borderW, opacity: 0.9 });
+          'fill-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.18, 0.08] } }, fillAnchor(map));
+      // No outline of our own: the WB boundary lines drawn on top are the
+      // borders, and a generalised polygon edge beside them reads as a double line.
+      // Member countries take the highlight; a non-determined area between a
+      // member and a non-member comes out at half strength, see ndlsaFill().
+      addNdlsaLayer(map, { ndlsa, colorForIso: iso => (isos.includes(iso) ? hl.fill : null),
+        opacity: 0.08, before: fillAnchor(map), t: tv, mode });
 
 
       // Preferred zones overlay (hidden until mapMode === 'zones')
@@ -410,7 +514,7 @@ export default function RegionPage() {
         filter: ['>', ['coalesce', ['get', 'mw'], 0], 0],
         layout: {
           visibility: 'none',
-          'text-field': ['get', 'label'],
+          'text-font': MAP_LABEL_FONT, 'text-field': ['get', 'label'],
           'text-size': 9,
           'symbol-placement': 'line-center',
           'text-allow-overlap': false,
@@ -432,20 +536,14 @@ export default function RegionPage() {
       });
 
       // ── Plant layers (3 status layers, data-driven fuel color) ───────────
-      const fuels = new Set();
-      for (const f of plantsGJ.features) {
-        const fuel = f.properties.fuel;
-        if (fuel && FUEL_COLORS[fuel]) fuels.add(fuel);
-      }
-      setPresentFuels(fuels);
-
+      // Their min-MW filter is set once the plant file is in (below).
       const colorExpr = fuelColorExpr();
 
       // Operating: filled circles
       map.addLayer({ id: 'plants-operating', type: 'circle', source: 'plants',
-        filter: makeLayerFilter('operating', new Set(), adaptMin),
+        filter: makeLayerFilter('operating', new Set(), 0),
         paint: {
-          'circle-radius':       plantRadiusExpr(),
+          'circle-radius':       plantRadiusExpr(PLANT_CIRCLE_SCALE),
           'circle-color':        colorExpr,
           'circle-opacity':      0.88,
           'circle-stroke-width': 0.6,
@@ -455,9 +553,9 @@ export default function RegionPage() {
 
       // Under construction: hollow ring
       map.addLayer({ id: 'plants-construction', type: 'circle', source: 'plants',
-        filter: makeLayerFilter('construction', new Set(), adaptMin),
+        filter: makeLayerFilter('construction', new Set(), 0),
         paint: {
-          'circle-radius':         plantRadiusExpr(),
+          'circle-radius':         plantRadiusExpr(PLANT_CIRCLE_SCALE),
           'circle-color':          'rgba(0,0,0,0)',
           'circle-opacity':        1,
           'circle-stroke-width':   2,
@@ -468,10 +566,10 @@ export default function RegionPage() {
 
       // Planned: faint filled + thin stroke — hidden by default (statusOff init)
       map.addLayer({ id: 'plants-planned', type: 'circle', source: 'plants',
-        filter: makeLayerFilter('planned', new Set(), adaptMin),
+        filter: makeLayerFilter('planned', new Set(), 0),
         layout: { visibility: 'none' },
         paint: {
-          'circle-radius':         plantRadiusExpr(),
+          'circle-radius':         plantRadiusExpr(PLANT_CIRCLE_SCALE),
           'circle-color':          colorExpr,
           'circle-opacity':        0.22,
           'circle-stroke-width':   1,
@@ -535,7 +633,7 @@ export default function RegionPage() {
         filter: ['>=', ['get', 'pop'], 300_000],
         layout: {
           visibility: 'none',
-          'text-field': ['get', 'name'], 'text-size': 9,
+          'text-font': MAP_LABEL_FONT, 'text-field': ['get', 'name'], 'text-size': 9,
           'text-offset': [0, 1.3], 'text-anchor': 'top', 'text-allow-overlap': false,
         },
         paint: {
@@ -557,30 +655,55 @@ export default function RegionPage() {
       map.on('mousemove', 'region-fill', e => {
         map.getCanvas().style.cursor = 'pointer';
         if (hoveredId !== null)
-          map.setFeatureState({ source: 'countries', id: hoveredId }, { hover: false });
-        hoveredId = e.features[0].id;
-        map.setFeatureState({ source: 'countries', id: hoveredId }, { hover: true });
+          map.setFeatureState(hoveredId, { hover: false });
+        hoveredId = featureTarget(e.features[0]);
+        map.setFeatureState(hoveredId, { hover: true });
       });
       map.on('mouseleave', 'region-fill', () => {
         map.getCanvas().style.cursor = '';
         if (hoveredId !== null)
-          map.setFeatureState({ source: 'countries', id: hoveredId }, { hover: false });
+          map.setFeatureState(hoveredId, { hover: false });
         hoveredId = null;
       });
+      // A click on a plant or substation opens its card; any other click in a
+      // member country, lines included, goes to the country page. Lines are
+      // too thin and dense here to share the click, so they only hover.
+      const POINT_LAYERS = [...PLANT_STATUSES.map(s => `plants-${s}`), 'substations'];
+      const onPoint = ({ point }) => {
+        const layers = POINT_LAYERS.filter(id => map.getLayer(id));
+        return layers.length > 0 && map.queryRenderedFeatures(point, { layers }).length > 0;
+      };
+      const openCountry = iso => {
+        track('map_feature_click', { kind: 'country', iso, region: regionId });
+        navigate(`/country/${iso}`);
+      };
       map.on('click', 'region-fill', e => {
         const iso = e.features[0].properties.ISO_A3;
-        if (isos.includes(iso)) navigate(`/country/${iso}`);
+        if (isos.includes(iso) && !onPoint(e)) openCountry(iso);
       });
       const onZoneClick = e => {
         const iso = e.features[0].properties.ISO_A3 || e.features[0].properties.country;
-        if (isos.includes(iso)) navigate(`/country/${iso}`);
+        if (isos.includes(iso) && !onPoint(e)) openCountry(iso);
       };
       map.on('click', 'region-zones-fill', onZoneClick);
       map.on('mouseenter', 'region-zones-fill', () => { map.getCanvas().style.cursor = 'pointer'; });
       map.on('mouseleave', 'region-zones-fill', () => { map.getCanvas().style.cursor = ''; });
 
-      // ── Feature click → detail panel ──────────────────────────────────────
-      const LINE_LAYERS = VOLTAGE_BRACKETS.map(b => `lines-${b.key}`);
+      // ── Line hover, plant and substation click ────────────────────────────
+      // A line's properties for the popup. Tiled lines hold only
+      // v; the rest arrives with the attributes file, fetched once the map
+      // is idle. Before then apply() gets v at once and is called again with
+      // the rest.
+      let lineAttrs = null, lineAttrsP = null;
+      const loadLineAttrs = () => (lineAttrsP ??= fetchData(linesAttrs(regionId))
+        .then(d => (lineAttrs = d)).catch(() => null));
+      const withLineProps = (feat, apply) => {
+        if (!tiled) return apply(feat.properties);
+        if (lineAttrs) return apply(attrsProps(lineAttrs, feat));
+        apply({ v: feat.properties.v });
+        loadLineAttrs().then(d => { if (d && !disposed) apply(attrsProps(d, feat)); });
+      };
+      let hoverToken = 0; // a late answer for a line since left is dropped
 
       // Line hover → popup with exact voltage + endpoint substation names
       const nearestSubName = (coord) => {
@@ -600,16 +723,16 @@ export default function RegionPage() {
         map.on('mouseenter', `lines-${key}`, e => {
           map.getCanvas().style.cursor = 'pointer';
           const feat = e.features[0];
-          const geom = feat.geometry;
-          const coords = geom.type === 'LineString' ? geom.coordinates : geom.coordinates.flat();
-          const fromName = nearestSubName(coords[0]);
-          const toName   = nearestSubName(coords[coords.length - 1]);
-          popup.setLngLat(e.lngLat)
-            .setHTML(linePopupHTML(feat.properties, [fromName, toName]))
-            .addTo(map);
+          const token = ++hoverToken;
+          popup.setLngLat(e.lngLat);
+          withLineProps(feat, props => {
+            if (token !== hoverToken) return;
+            const [start, end] = lineEnds(props, feat);
+            popup.setHTML(linePopupHTML(props, [nearestSubName(start), nearestSubName(end)])).addTo(map);
+          });
         });
         map.on('mousemove', `lines-${key}`, e => { popup.setLngLat(e.lngLat); });
-        map.on('mouseleave', `lines-${key}`, () => { map.getCanvas().style.cursor = ''; popup.remove(); });
+        map.on('mouseleave', `lines-${key}`, () => { hoverToken++; map.getCanvas().style.cursor = ''; popup.remove(); });
       }
 
       // Plants — keep hover popup, add click for detail panel
@@ -617,63 +740,112 @@ export default function RegionPage() {
       for (const status of PLANT_STATUSES) {
         map.on('click', `plants-${status}`, e => {
           clickedPoint = true;
-          setSelFeature({ type: 'plant', props: e.features[0].properties });
+          const p = e.features[0].properties;
+          setSelFeature({ type: 'plant', props: p });
+          track('map_feature_click', { kind: 'plant', name: p.name, fuel: p.fuel, status: p.status, mw: p.mw, region: regionId });
         });
       }
 
       // Substations — keep hover popup, add click for detail panel
       map.on('click', 'substations', e => {
         clickedPoint = true;
-        setSelFeature({ type: 'substation', props: e.features[0].properties });
+        const p = e.features[0].properties;
+        setSelFeature({ type: 'substation', props: p });
+        track('map_feature_click', { kind: 'substation', name: p.name, region: regionId });
       });
 
-      // General map click: handle lines (queryRenderedFeatures with bbox) + background clear
-      map.on('click', e => {
-        if (clickedPoint) { clickedPoint = false; return; }
-        clickedPoint = false;
-
-        // Query line features within 8px radius of click
-        const { x, y } = e.point;
-        const bbox = [[x - 8, y - 8], [x + 8, y + 8]];
-        const activeLayers = LINE_LAYERS.filter(id => { try { return !!map.getLayer(id); } catch { return false; } });
-        const lineFeats = activeLayers.length ? map.queryRenderedFeatures(bbox, { layers: activeLayers }) : [];
-
-        if (lineFeats.length > 0) {
-          const props   = lineFeats[0].properties;
-          const v       = props.v;
-          const bracket = bracketFor(v);
-          const geom = lineFeats[0].geometry;
-          const coords = geom.type === 'LineString' ? geom.coordinates : geom.coordinates.flat();
-          setSelFeature({
-            type:  'line',
-            props: { ...props, voltageLabel: v ? `${Math.round(v / 1000)} kV` : bracket.label },
-            km:    lineKm(coords),
-          });
-        } else {
-          setSelFeature(null);
-        }
+      // Any other click closes the card.
+      map.on('click', () => {
+        if (clickedPoint) clickedPoint = false;
+        else setSelFeature(null);
       });
 
       raiseBoundaries(map);
+      // Anything toggled while the map was still loading. applyWbView() needs
+      // the basemap fully in, which 'style.load' does not wait for.
+      map.once('idle', () => { if (!disposed) applyWbView(map, wbViewRef.current); });
+
+      // ── Data layers, each filled as its file arrives ─────────────────────
+      const [plantsFile, linesFile, subsFile, lcFile] = regionDataFiles(regionId);
+      const optional = p => fetchData(dataPath(p)).catch(() => empty());
+      const lines = (async () => {
+        const linesGJ = summary?.lines ? null : await fetchData(dataPath(linesFile));
+        if (disposed) return;
+        const volts = summary?.lines ? summary.lines.voltages : linesGJ.features.map(f => f.properties.v || 0);
+        // Slider floor comes from the data itself: regions.yaml sets a different
+        // min_kv per region, and this way the UI never promises voltages the file
+        // doesn't hold.
+        const taggedKv = volts.filter(v => v > 0);
+        const floorKv = taggedKv.length ? Math.floor(Math.min(...taggedKv) / 1000) : 110;
+        setKvFloor(floorKv);
+        // A theme switch rebuilds the map from scratch; keep whatever the slider
+        // was set to as long as the new data can honour it, and only fall back to
+        // the floor when it can't (first load, or a region with a higher floor).
+        setMinKv(kv => (kv >= floorKv && kv <= 500 ? kv : floorKv));
+        // Regions with a 110 kV floor hold no 33-110 kV and no untagged lines;
+        // an empty legend row would just be a dead checkbox.
+        setPresentKvs(new Set(volts.map(v => bracketFor(v).key)));
+        // Tiled lines are already on their way, and their attributes follow
+        // once the map is idle; a big untiled region draws its 220 kV+ lines
+        // first and the rest follow.
+        if (tiled) { map.once('idle', () => { if (!disposed) loadLineAttrs(); }); return; }
+        if (summary?.lines?.first)
+          setDataInStages(map, 'lines', absUrl(dataPath(firstPass(linesFile))),
+            absUrl(dataPath(linesFile)), () => !disposed).catch(e => console.error('region lines', e));
+        else map.getSource('lines')?.setData(linesGJ ?? absUrl(dataPath(linesFile)));
+      })();
+      const plants = (async () => {
+        const facts = summary?.plants?.osm;
+        const plantsGJ = facts ? null : await fetchData(dataPath(plantsFile));
+        if (disposed) return;
+        // The starting min-MW comes from OSM's capacities whatever the source.
+        const { adaptMin } = plantFacts(facts, plantsGJ);
+        setMinMw(adaptMin);
+        for (const status of PLANT_STATUSES)
+          if (map.getLayer(`plants-${status}`))
+            map.setFilter(`plants-${status}`, makeLayerFilter(status, new Set(), adaptMin));
+        // The selected source straight away (GEM by default), not OSM first and
+        // then a second big file; OSM when the summary lists no such source.
+        // Without a summary, OSM as read above, and the source swap below
+        // brings in any other.
+        const want = plantSourceRef.current;
+        const source = summary && summary.plants[want] ? want : 'osm';
+        if (source !== want) setPlantSource('osm');
+        plantsShownRef.current = source;
+        const srcFacts = summary?.plants?.[source];
+        setPresentFuels(plantFacts(srcFacts, plantsGJ).fuels);
+        const file = `cache/region_plants_${regionId}${SOURCE_SUFFIX[source]}.geojson`;
+        if (srcFacts?.first)
+          setDataInStages(map, 'plants', absUrl(dataPath(firstPass(file))), absUrl(dataPath(file)),
+            () => !disposed && plantsShownRef.current === source).catch(e => console.error('region plants', e));
+        else map.getSource('plants')?.setData(plantsGJ ?? absUrl(dataPath(file)));
+      })();
+      const subs = optional(subsFile).then(gj => { if (!disposed) map.getSource('substations')?.setData(gj); });
+      const lcs  = optional(lcFile).then(gj => { if (!disposed) map.getSource('load-centers')?.setData(gj); });
+      const results = await Promise.allSettled([plants, lines, subs, lcs]);
+      for (const r of results) if (r.status === 'rejected') console.error('region map data', r.reason);
+      if (disposed) return;
+      // Ready once the data is in: the plant-source swap and the chat act on it.
       setMapReady(true);
     });
 
-    return () => { popup.remove(); mapRef.current?.remove(); setMapReady(false); };
-  }, [region, theme]);
+    return () => {
+      disposed = true;
+      popup.remove();
+      mapRef.current?.remove();
+      mapRef.current = null;
+      setMapReady(false);
+    };
+  }, [region, theme, wbBase]);
 
   // ── Basemap switcher ─────────────────────────────────────────────────────
+  // The initial view is baked into the style; later changes are applied live.
   useEffect(() => {
+    wbViewRef.current = wbView;
     const map = mapRef.current;
-    if (!map) return;
-    swapBasemap(map, basemap, theme);
-    if (basemap !== 'satellite') toggleSatLabels(map, false, theme);
-  }, [basemap, theme]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || basemap !== 'satellite') return;
-    toggleSatLabels(map, satLabels, theme);
-  }, [satLabels, basemap, theme]);
+    if (!map || !mapReady) return;
+    applyWbView(map, wbView);
+  }, [wbView, mapReady]);
 
   // ── Zone mode / refine toggle ─────────────────────────────────────────────
   useEffect(() => {
@@ -683,11 +855,11 @@ export default function RegionPage() {
 
     if (showZones) {
       const slug       = selectedSlug || 'recommended';
-      const url        = `/data/zones/${regionId}_${slug}_zones_hd.geojson`;
-      const corrUrl    = `/data/zones/${regionId}_${slug}_corridors.geojson`;
+      const url        = dataPath(`zones/${regionId}_${slug}_zones_hd.geojson`);
+      const corrUrl    = dataPath(`zones/${regionId}_${slug}_corridors.geojson`);
       Promise.all([
-        fetch(url).then(r => { if (!r.ok) throw new Error(); return r.json(); }),
-        fetch(corrUrl).then(r => r.ok ? r.json() : null).catch(() => null),
+        fetchData(url),
+        fetchData(corrUrl).catch(() => null),
       ])
         .then(([data, corridorsGJ]) => {
           const m = mapRef.current;
@@ -738,19 +910,34 @@ export default function RegionPage() {
 
   // ── Layer toggle handlers ─────────────────────────────────────────────────
 
+  // Flip a corridor class on or off: its state flag and its map layers together.
+  const onCorridorToggle = e => {
+    const label = e.currentTarget.dataset.corridor;
+    const map = mapRef.current;
+    if (!map) return;
+    const setter = { Existing: setCorrExistOn, Committed: setCorrCommOn, Candidate: setCorrCandOn }[label];
+    setter(prev => {
+      const next = !prev;
+      for (const id of CORRIDOR_LAYERS[label])
+        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', next ? 'visible' : 'none');
+      return next;
+    });
+  };
+
   const toggleFuel = useCallback(fuel => {
     const map = mapRef.current;
     if (!map) return;
     setFuelsOff(prev => {
       const next = new Set(prev);
       if (next.has(fuel)) next.delete(fuel); else next.add(fuel);
+      track('filter_change', { filter: 'fuel', value: fuel, on: !next.has(fuel), region: regionId });
       for (const s of PLANT_STATUSES) {
         if (map.getLayer(`plants-${s}`))
           map.setFilter(`plants-${s}`, makeLayerFilter(s, next, minMw));
       }
       return next;
     });
-  }, [minMw]);
+  }, [minMw, regionId]);
 
   const toggleStatus = useCallback(status => {
     const map = mapRef.current;
@@ -759,11 +946,12 @@ export default function RegionPage() {
       const next    = new Set(prev);
       const hiding  = !prev.has(status);
       if (hiding) next.add(status); else next.delete(status);
+      track('filter_change', { filter: 'status', value: status, on: !hiding, region: regionId });
       if (plantsOn)
         map.setLayoutProperty(`plants-${status}`, 'visibility', hiding ? 'none' : 'visible');
       return next;
     });
-  }, [plantsOn]);
+  }, [plantsOn, regionId]);
 
   const toggleKv = useCallback(key => {
     const map = mapRef.current;
@@ -772,9 +960,10 @@ export default function RegionPage() {
       const next = new Set(prev);
       if (next.has(key)) { next.delete(key); map.setLayoutProperty(`lines-${key}`, 'visibility', 'visible'); }
       else               { next.add(key);    map.setLayoutProperty(`lines-${key}`, 'visibility', 'none');    }
+      track('filter_change', { filter: 'voltage', value: key, on: !next.has(key), region: regionId });
       return next;
     });
-  }, []);
+  }, [regionId]);
 
   const toggleLines = useCallback(() => {
     const map = mapRef.current;
@@ -784,9 +973,10 @@ export default function RegionPage() {
       for (const { key } of VOLTAGE_BRACKETS)
         if (!kvsOff.has(key) && map.getLayer(`lines-${key}`))
           map.setLayoutProperty(`lines-${key}`, 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'lines', value: next, region: regionId });
       return next;
     });
-  }, [kvsOff]);
+  }, [kvsOff, regionId]);
 
   const togglePlants = useCallback(() => {
     const map = mapRef.current;
@@ -798,9 +988,10 @@ export default function RegionPage() {
         if (!statusOff.has(s))
           map.setLayoutProperty(`plants-${s}`, 'visibility', next ? 'visible' : 'none');
       }
+      track('map_option_change', { option: 'plants', value: next, region: regionId });
       return next;
     });
-  }, [statusOff]);
+  }, [statusOff, regionId]);
 
   const toggleSubs = useCallback(() => {
     const map = mapRef.current;
@@ -808,9 +999,10 @@ export default function RegionPage() {
     setSubsOn(prev => {
       const next = !prev;
       map.setLayoutProperty('substations', 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'substations', value: next, region: regionId });
       return next;
     });
-  }, []);
+  }, [regionId]);
 
   const handleMinMw = useCallback(mw => {
     const map = mapRef.current;
@@ -822,8 +1014,13 @@ export default function RegionPage() {
   }, [fuelsOff]);
 
   const toggleCountry = useCallback(iso => {
-    setCountriesOff(prev => { const n = new Set(prev); n.has(iso) ? n.delete(iso) : n.add(iso); return n; });
-  }, []);
+    setCountriesOff(prev => {
+      const n = new Set(prev);
+      n.has(iso) ? n.delete(iso) : n.add(iso);
+      track('filter_change', { filter: 'country', value: iso, on: !n.has(iso), region: regionId });
+      return n;
+    });
+  }, [regionId]);
   const selectAllCountries = useCallback(() => setCountriesOff(new Set()), []);
   const deselectAllCountries = useCallback(() => {
     if (!region) return;
@@ -839,22 +1036,6 @@ export default function RegionPage() {
         map.setPaintProperty(`plants-${s}`, 'circle-radius', plantRadiusExpr(scale));
   }, []);
 
-  const makeCorridorToggle = (layerIds, setter) => () => {
-    const map = mapRef.current;
-    if (!map) return;
-    setter(prev => {
-      const next = !prev;
-      for (const id of layerIds)
-        if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', next ? 'visible' : 'none');
-      return next;
-    });
-  };
-  const toggleCorrExist = useCallback(
-    makeCorridorToggle(['region-corridors-ex', 'region-corridors-labels', 'region-corridors-dots'], setCorrExistOn), []);
-  const toggleCorrComm  = useCallback(
-    makeCorridorToggle(['region-corridors-committed', 'region-corridors-dots'], setCorrCommOn), []);
-  const toggleCorrCand  = useCallback(
-    makeCorridorToggle(['region-corridors-candidate', 'region-corridors-dots'], setCorrCandOn), []);
 
   const toggleLoadCenters = useCallback(() => {
     const map = mapRef.current;
@@ -863,9 +1044,10 @@ export default function RegionPage() {
       const next = !prev;
       for (const id of ['load-centers', 'load-centers-labels'])
         if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'load_centers', value: next, region: regionId });
       return next;
     });
-  }, []);
+  }, [regionId]);
 
   const handleLcMinPop = useCallback(pop => {
     const map = mapRef.current;
@@ -887,19 +1069,26 @@ export default function RegionPage() {
   useEffect(() => {
     const map = mapRef.current;
     if (!map?.getSource('plants') || !mapReady) return;
-    const suffix = plantSource === 'gppd' ? '_gppd' : plantSource === 'gem' ? '_gem' : '';
+    const suffix = SOURCE_SUFFIX[plantSource];
     const f    = `region_plants_${regionId}${suffix}.geojson`;
-    const cf   = `/data/cache/region_capacity_${regionId}${suffix}.json`;
-    const cfBase = `/data/cache/region_capacity_${regionId}.json`;
-    fetch(`/data/cache/${f}`)
-      .then(r => { if (!r.ok) throw new Error(); return r.json(); })
-      .then(data => {
-        map.getSource('plants').setData(data);
-        const fuels = new Set(data.features.map(f => f.properties.fuel).filter(f => FUEL_COLORS[f]));
-        setPresentFuels(fuels);
+    const cf   = dataPath(`cache/region_capacity_${regionId}${suffix}.json`);
+    const cfBase = dataPath(`cache/region_capacity_${regionId}.json`);
+    fetchSummary(regionId)
+      .then(async summary => {
+        const facts = summary?.plants?.[SOURCE_KEY[suffix]];
+        // A summary that lists no such source means the file is not there.
+        if (summary && !facts) throw new Error(`no ${f}`);
+        // The map may have opened on this source already; the capacity below
+        // is still this effect's to set.
+        if (plantsShownRef.current !== plantSource) {
+          const data = facts ? null : await fetchData(dataPath(`cache/${f}`));
+          map.getSource('plants').setData(data ?? absUrl(dataPath(`cache/${f}`)));
+          plantsShownRef.current = plantSource;
+          setPresentFuels(plantFacts(facts, data).fuels);
+        }
         return Promise.all([
-          suffix ? fetch(cfBase).then(r => r.json()).catch(() => null) : Promise.resolve(null),
-          fetch(cf).then(r => r.json()).catch(() => null),
+          suffix ? fetchData(cfBase).catch(() => null) : Promise.resolve(null),
+          fetchData(cf).catch(() => null),
         ]);
       })
       .then(([base, primary]) => {
@@ -920,8 +1109,8 @@ export default function RegionPage() {
   const handleDownloadPlants = useCallback(async (format = 'geojson') => {
     track('data_download', { type: 'plants', format, source: plantSource, region: regionId });
     const suffix = plantSource === 'gppd' ? '_gppd' : plantSource === 'gem' ? '_gem' : '';
-    const url  = `/data/cache/region_plants_${regionId}${suffix}.geojson`;
-    const data = await fetch(url).then(r => r.json());
+    const url  = dataPath(`cache/region_plants_${regionId}${suffix}.geojson`);
+    const data = await fetchData(url);
     if (format === 'csv') {
       const header = 'name,fuel,mw,country,status,lat,lon,source';
       const rows = data.features.map(f => {
@@ -969,15 +1158,25 @@ export default function RegionPage() {
     setMinKv(kv);
     applyMinKv(kv, false);
     clearTimeout(minKvCommitRef.current);
-    minKvCommitRef.current = setTimeout(() => applyMinKv(kv, true), 250);
-  }, [applyMinKv]);
+    minKvCommitRef.current = setTimeout(() => {
+      applyMinKv(kv, true);
+      track('filter_change', { filter: 'min_kv', value: kv, region: regionId });
+    }, 250);
+  }, [applyMinKv, regionId]);
 
   useEffect(() => () => clearTimeout(minKvCommitRef.current), []);
 
+  // The basemap panel hands back the whole view; report the one field that changed.
+  const changeWbView = useCallback(next => {
+    setWbView(next);
+    const option = Object.keys(next).find(k => next[k] !== wbView[k]);
+    if (option) track('map_option_change', { option, value: next[option], region: regionId });
+  }, [wbView, regionId]);
+
   const handleDownloadLines = useCallback(async (format = 'geojson') => {
     track('data_download', { type: 'lines', format, region: regionId });
-    const url  = `/data/cache/region_lines_${regionId}.geojson`;
-    const data = await fetch(url).then(r => r.json());
+    const url  = dataPath(`cache/region_lines_${regionId}.geojson`);
+    const data = await fetchData(url);
     // What you see is what you get: the legend toggles and the min-kV slider sit
     // next to this button, so the file matches the map rather than the raw cache.
     const feats = visibleLineFeatures(data.features, { minKv, kvsOff });
@@ -1000,6 +1199,7 @@ export default function RegionPage() {
     });
     downloadBlob([header, ...rows].map(r => r.join(',')).join('\n'),
       `capacity_${regionId}.csv`, 'text/csv');
+    track('data_download', { type: 'capacity', format: 'csv', region: regionId });
   }, [capacity, region, regionId]);
 
   const handleDownloadTariffs = useCallback(() => {
@@ -1012,6 +1212,7 @@ export default function RegionPage() {
     });
     downloadBlob(['country,iso,residential_usd_mwh,industrial_usd_mwh', ...rows.map(r => r.join(','))].join('\n'),
       `tariffs_${regionId}.csv`, 'text/csv');
+    track('data_download', { type: 'tariffs', format: 'csv', region: regionId });
   }, [tariffs, region, regionId]);
 
   const handleDownloadAccess = useCallback(() => {
@@ -1022,6 +1223,7 @@ export default function RegionPage() {
     });
     downloadBlob(['country,iso,total_pct,urban_pct,rural_pct', ...rows.map(r => r.join(','))].join('\n'),
       `access_${regionId}.csv`, 'text/csv');
+    track('data_download', { type: 'access', format: 'csv', region: regionId });
   }, [access, region, regionId]);
 
   // ── Render ────────────────────────────────────────────────────────────────
@@ -1039,11 +1241,11 @@ export default function RegionPage() {
 
   return (
     <div style={{ display: 'flex', height: 'calc(100vh - 46px)', position: 'relative' }}
-      onMouseMove={e => { if (!isDrRef.current) return; setPanelWidth(w => Math.max(PANEL_WIDTH_MIN, Math.min(PANEL_WIDTH_MAX, drStartW.current + (drStartX.current - e.clientX)))); }}
+      onMouseMove={e => { if (!isDrRef.current) return; setPanelWidth(Math.max(PANEL_WIDTH_MIN, Math.min(PANEL_WIDTH_MAX, drStartW.current + (drStartX.current - e.clientX)))); }}
       onMouseUp={() => { isDrRef.current = false; }}
       onMouseLeave={() => { isDrRef.current = false; }}
     >
-      <MapChat mapRef={mapRef} mapKey={mapRef.current} ready={mapReady} controller={{
+      <MapChat theme={theme} mapRef={mapRef} ready={mapReady} controller={{
         page: 'region', regionId, tab: activeTab, navigate,
         setTab: setActiveTab, setPlantSource, setMinMw: handleMinMw,
         showOnlyFuels: fuels => { for (const f of presentFuels) if (fuelsOff.has(f) === fuels.includes(f)) toggleFuel(f); },
@@ -1066,8 +1268,9 @@ export default function RegionPage() {
         minMw={minMw} circleScale={circleScale}
         plantSource={plantSource}
         gppdAvailable={gppdAvailable} gemAvailable={gemAvailable} regionId={regionId}
+        gridNote={region?.grid_note}
         presentFuels={presentFuels}
-        basemap={basemap} onBasemap={setBasemap} satLabels={satLabels} onSatLabels={setSatLabels}
+        wbView={wbView} onWbView={changeWbView}
         onToggleFuel={toggleFuel} onToggleStatus={toggleStatus}
         onToggleKv={toggleKv}
         onToggleLines={toggleLines} onTogglePlants={togglePlants}
@@ -1117,7 +1320,11 @@ export default function RegionPage() {
             <>
               {/* Potential Zonings toggle */}
               <button
-                onClick={() => setMapMode(m => m === 'zones' ? 'countries' : 'zones')}
+                onClick={() => {
+                  const next = mapMode === 'zones' ? 'countries' : 'zones';
+                  setMapMode(next);
+                  track('map_option_change', { option: 'map_mode', value: next, region: regionId });
+                }}
                 style={{
                   display: 'flex', alignItems: 'center', gap: 6,
                   fontSize: '0.58rem', letterSpacing: '0.5px', fontFamily: 'inherit',
@@ -1159,11 +1366,11 @@ export default function RegionPage() {
 
               {/* Corridor type toggles — only in zone mode */}
               {mapMode === 'zones' && [
-                { label: 'Existing',   on: corrExistOn, toggle: toggleCorrExist, color: '#1a5fa8', dash: null },
-                { label: 'Committed',  on: corrCommOn,  toggle: toggleCorrComm,  color: '#e07b00', dash: '8 3' },
-                { label: 'Candidate',  on: corrCandOn,  toggle: toggleCorrCand,  color: '#666',    dash: '2 4' },
-              ].map(({ label, on, toggle, color, dash }) => (
-                <button key={label} onClick={toggle} style={{
+                { label: 'Existing',   on: corrExistOn, color: '#1a5fa8', dash: null },
+                { label: 'Committed',  on: corrCommOn,  color: '#e07b00', dash: '8 3' },
+                { label: 'Candidate',  on: corrCandOn,  color: '#666',    dash: '2 4' },
+              ].map(({ label, on, color, dash }) => (
+                <button key={label} data-corridor={label} onClick={onCorridorToggle} style={{
                   display: 'flex', alignItems: 'center', gap: 5,
                   fontSize: '0.58rem', letterSpacing: '0.5px', fontFamily: 'inherit',
                   padding: '5px 9px', borderRadius: 6, cursor: 'pointer',
@@ -1221,31 +1428,6 @@ export default function RegionPage() {
               color: t.lblMuted, fontSize: '0.9rem', lineHeight: 1, padding: 0,
             }}>✕</button>
 
-            {selFeature.type === 'line' && (
-              <>
-                <div style={{ fontWeight: 700, marginBottom: 6, color: t.lbl }}>
-                  {selFeature.props.nm || 'Transmission line'}
-                </div>
-                <Row label="Voltage" value={selFeature.props.voltageLabel} t={t} />
-                {selFeature.km > 0 && (
-                  <Row label="Length" value={`~${Math.round(selFeature.km)} km`} t={t} />
-                )}
-                {['op', 'c', 'f', 'l', 'st'].map(k => (
-                  selFeature.props[k] ? (
-                    <Row key={k} label={LINE_ATTR_LABELS[k]}
-                      value={lineAttrText(k, selFeature.props[k])} t={t} />
-                  ) : null
-                ))}
-                {selFeature.props.oid && (
-                  <Row label="Source" t={t} value={
-                    <a href={`https://www.openstreetmap.org/way/${selFeature.props.oid}`}
-                      target="_blank" rel="noreferrer"
-                      style={{ color: t.lblRow }}>OpenStreetMap ↗</a>
-                  } />
-                )}
-              </>
-            )}
-
             {selFeature.type === 'plant' && (() => {
               const p = selFeature.props;
               return (
@@ -1284,6 +1466,24 @@ export default function RegionPage() {
           </div>
         )}
 
+        {/* Back to the world view, and the Equal Earth export — top-left of the
+            map (under Legend & Filter on phones) */}
+        <div style={{
+          position: 'absolute', zIndex: 60, display: 'flex', alignItems: 'flex-start', gap: 6,
+          ...(isMobile ? { top: 56, left: 12 } : { top: 10, left: 12 }),
+        }}>
+          <WorldButton t={t} compact={isMobile} />
+          <ExportControl
+            mapRef={mapRef} ready={mapReady} t={t} compact={isMobile}
+            style={{ position: 'relative', left: 0 }}
+            title={`Regional Power Explorer — ${region.name}`}
+            fileName={`regional-power-explorer-${regionId}`}
+            defaultBasemap={wbView.canvas}
+            sourceData={{ lines: () => fetchData(dataPath(regionDataFiles(regionId)[1])) }}
+            legend={() => powerLegend({ presentFuels, fuelsOff, presentKvs, theme })}
+          />
+        </div>
+
         {/* ── Map disclaimer ── */}
         <div style={{
           position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)',
@@ -1293,7 +1493,7 @@ export default function RegionPage() {
           fontSize: '0.47rem', color: t.lblMuted, textAlign: 'center',
           whiteSpace: 'nowrap', letterSpacing: '0.3px',
         }}>
-          Pilot · Indicative data · Partly AI-generated, not fact-checked · Boundaries for reference only · Unofficial
+          Pilot
         </div>
       </div>
 

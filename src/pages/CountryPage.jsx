@@ -1,22 +1,26 @@
+import { dataPath } from '../utils/paths';
+import { pointInFeature } from '../utils/pointInFeature';
+import { fetchData } from '../utils/dataCache';
 import { useEffect, useRef, useState, useCallback } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
 import { track } from '../analytics';
 import maplibregl from 'maplibre-gl';
 import { useTheme } from '../App';
-import { getT, mapStyle, swapBasemap, toggleSatLabels, FUEL_COLORS, VOLTAGE_BRACKETS, kvFilterWithFloor, bracketFor, LINE_ATTR_LABELS, lineAttrText, linePopupHTML, visibleLineFeatures, linesToCSV, linesToDownloadGeoJSON, plantRadiusExpr, lcRadiusExpr, adaptiveMinMw, defaultNZones, PANEL_WIDTH_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, BRIEFS_ENABLED } from '../constants';
+import { getT, FUEL_COLORS, VOLTAGE_BRACKETS, kvFilterWithFloor, bracketFor, LINE_ATTR_LABELS, lineAttrText, linePopupHTML, visibleLineFeatures, linesToCSV, linesToDownloadGeoJSON, plantRadiusExpr, lcRadiusExpr, PLANT_CIRCLE_SCALE, adaptiveMinMw, defaultNZones, PANEL_WIDTH_MIN, PANEL_WIDTH_DEFAULT, PANEL_WIDTH_MAX, BRIEFS_ENABLED } from '../constants';
 import LayerPanel from '../components/LayerPanel';
-import MapChat from '../chat/MapChat';
+import MapChat from '../chat/LazyMapChat';
+import ExportControl from '../components/ExportControl';
+import WorldButton from '../components/WorldButton';
+import { powerLegend } from '../utils/exportLegend';
 import CountryOverview from '../components/CountryOverview';
 import REResourcesTab from '../components/tabs/REResourcesTab';
 import LoadTab from '../components/tabs/LoadTab';
 import ZoningTab from '../components/tabs/ZoningTab';
 import SupplyTab from '../components/tabs/SupplyTab';
 import MarketTab from '../components/tabs/MarketTab';
-import { fetchCountries, fetchBoundaries, addCountriesSource, addBaseLayers, raiseBoundaries } from '../utils/basemap';
-
-// Same Google Apps Script web-app as ContactPage (writes to the shared Sheet).
-// Brief-edit suggestions are tagged type='brief-edit' and routed to a "Brief Edits" tab.
-const GOOGLE_APPS_SCRIPT_URL = 'https://script.google.com/macros/s/AKfycbxKtNsfk0dX5SET9ajr4jZ0YK058f94jyjzTpiUFQZZkp9jTh6p_TtPiI6Gv6UeLhTx/exec';
+import { buildWbStyle, applyWbView, useWbStyleBase, DEFAULT_WB_VIEW, MAP_LABEL_FONT } from '../utils/wbStyle';
+import { fetchGeo, prefetchGeo, fetchBboxes, fetchNdlsa, boundsFor, addCountriesSource, addNdlsaLayer, raiseBoundaries, fillAnchor, isItalicName } from '../utils/basemap';
+import { CONTACT_EMAIL, openMail } from '../utils/mailto';
 
 const EDIT_LBL = { display: 'block', fontSize: '0.6rem', fontWeight: 600, color: '#5A6474', margin: '10px 0 3px', letterSpacing: '0.3px' };
 const EDIT_INP = { width: '100%', boxSizing: 'border-box', fontFamily: 'inherit', fontSize: '0.72rem', padding: '6px 8px', borderRadius: 4, border: '1px solid #D5DBE2', color: '#1B2A4A', resize: 'vertical' };
@@ -70,42 +74,6 @@ function downloadBlob(content, filename, type = 'application/octet-stream') {
 }
 
 // Ray-casting point-in-polygon (handles Polygon + MultiPolygon)
-function pointInRing(pt, ring) {
-  let inside = false;
-  const [x, y] = pt;
-  for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
-    const [xi, yi] = ring[i], [xj, yj] = ring[j];
-    if ((yi > y) !== (yj > y) && x < ((xj - xi) * (y - yi)) / (yj - yi) + xi)
-      inside = !inside;
-  }
-  return inside;
-}
-function pointInFeature(pt, feature) {
-  const g = feature.geometry;
-  if (g.type === 'Polygon')
-    return g.coordinates.some(ring => pointInRing(pt, ring));
-  if (g.type === 'MultiPolygon')
-    return g.coordinates.some(poly => poly.some(ring => pointInRing(pt, ring)));
-  return false;
-}
-
-function fitBoundsCountry(iso, countries) {
-  let minLon = Infinity, maxLon = -Infinity, minLat = Infinity, maxLat = -Infinity;
-  for (const f of countries.features) {
-    if (f.properties.ISO_A3 !== iso) continue;
-    const geom = f.geometry;
-    const rings = geom.type === 'Polygon'
-      ? geom.coordinates
-      : geom.coordinates.flatMap(p => p);
-    for (const ring of rings)
-      for (const [lon, lat] of ring) {
-        if (lon < minLon) minLon = lon; if (lon > maxLon) maxLon = lon;
-        if (lat < minLat) minLat = lat; if (lat > maxLat) maxLat = lat;
-      }
-  }
-  if (!isFinite(minLon)) return null;
-  return [[minLon - 0.8, minLat - 0.8], [maxLon + 0.8, maxLat + 0.8]];
-}
 
 export default function CountryPage() {
   const { iso }      = useParams();
@@ -125,7 +93,7 @@ export default function CountryPage() {
   const [plantsOn,     setPlantsOn]     = useState(true);
   const [subsOn,       setSubsOn]       = useState(false);
   const [minMw,        setMinMw]        = useState(100);
-  const [circleScale,  setCircleScale]  = useState(1.0);
+  const [circleScale,  setCircleScale]  = useState(PLANT_CIRCLE_SCALE);
   const [plantSource,        setPlantSource]        = useState('gem');
   const [selFeature,         setSelFeature]         = useState(null);
   const [gppdAvailable,      setGppdAvailable]      = useState(null);
@@ -139,15 +107,15 @@ export default function CountryPage() {
   const [minKv,            setMinKv]            = useState(0);
   const [kvFloor,          setKvFloor]          = useState(110);
   const [presentKvs,       setPresentKvs]       = useState(null);
-  const [countryCenter,      setCountryCenter]      = useState(null);
   const [countryReady,       setCountryReady]       = useState(false);
   const [activeTab,          setActiveTab]          = useState('overview');
   const [panelWidth,         setPanelWidth]         = useState(PANEL_WIDTH_DEFAULT); // same starting size as RegionPage
   const isDrRef   = useRef(false);
   const drStartX  = useRef(0);
   const drStartW  = useRef(0);
-  const [basemap,            setBasemap]            = useState('minimal');
-  const [satLabels,          setSatLabels]          = useState(false);
+  const [wbView,             setWbView]             = useState(DEFAULT_WB_VIEW);
+  const wbViewRef = useRef(wbView);   // what a rebuilt map (theme change) starts from
+  const wbBase = useWbStyleBase();
   const [loadCentersOn,      setLoadCentersOn]      = useState(true);
   const [lcMinPop,           setLcMinPop]           = useState(300_000);
   const [lcCircleScale,      setLcCircleScale]      = useState(1.0);
@@ -161,7 +129,7 @@ export default function CountryPage() {
   const [noteOpen,   setNoteOpen]   = useState(false);
   const noteIframeRef = useRef(null);
   const [editOpen,   setEditOpen]   = useState(false);
-  const [editForm,   setEditForm]   = useState({ passage: '', suggestion: '', firstName: '', lastName: '', email: '' });
+  const [editForm,   setEditForm]   = useState({ passage: '', suggestion: '' });
   const [editStatus, setEditStatus] = useState('idle');
 
   // Open the "suggest an edit" form, pre-filling any text the user highlighted in
@@ -169,35 +137,29 @@ export default function CountryPage() {
   const openEditSuggestion = () => {
     let passage = '';
     try { passage = noteIframeRef.current?.contentWindow?.getSelection?.().toString().trim() || ''; } catch { /* guard */ }
-    setEditForm({ passage, suggestion: '', firstName: '', lastName: '', email: '' });
+    setEditForm({ passage, suggestion: '' });
     setEditStatus('idle');
     setEditOpen(true);
+    track('form_open', { form: 'edit_suggestion', iso });
   };
 
-  async function submitEditSuggestion(e) {
+  function submitEditSuggestion(e) {
     e.preventDefault();
     if (!editForm.suggestion.trim()) return;
-    setEditStatus('sending');
-    try {
-      await fetch(GOOGLE_APPS_SCRIPT_URL, {
-        method: 'POST', mode: 'no-cors',
-        body: new URLSearchParams({
-          type: 'brief-edit',
-          country: country?.name || '', iso,
-          passage: editForm.passage, suggestion: editForm.suggestion,
-          name: `${editForm.firstName} ${editForm.lastName}`.trim(),
-          firstName: editForm.firstName, lastName: editForm.lastName,
-          email: editForm.email,
-          url: window.location.href,
-          source: 'Regional Power Explorer',
-        }),
-      });
-      setEditStatus('sent');
-    } catch {
-      setEditStatus('error');
-    }
+    const body = [
+      `Country: ${country?.name || ''} (${iso})`,
+      `Page: ${window.location.href}`,
+      '',
+      ...(editForm.passage.trim() ? ['Passage concerned:', editForm.passage.trim(), ''] : []),
+      'Suggested correction:',
+      editForm.suggestion.trim(),
+    ].join('\n');
+    openMail(`Briefing note edit: ${country?.name || iso}`, body);
+    setEditStatus('sent');
+    track('form_submit', { form: 'edit_suggestion', iso });
   }
   const mapReadyRef        = useRef(false);
+  const [mapReady,        setMapReady]        = useState(false);
   const countryFeatureRef  = useRef(null);
   const adaptiveMinRef     = useRef(0);   // adaptive default min-MW for this country
   const [isMobile,        setIsMobile]        = useState(() => window.innerWidth < 700);
@@ -205,6 +167,8 @@ export default function CountryPage() {
   const [sheetHeight,     setSheetHeight]     = useState(96);
   const [isDragging,      setIsDragging]      = useState(false);
   const dragRef = useRef(null);
+
+  useEffect(() => { prefetchGeo('country', iso); }, [iso]);
 
   useEffect(() => {
     const handler = () => setIsMobile(window.innerWidth < 700);
@@ -245,33 +209,33 @@ export default function CountryPage() {
 
   // Static data — fetch once
   useEffect(() => {
-    fetch('/data/tariffs.json').then(r => r.json()).then(setTariffs).catch(() => {});
-    fetch('/data/access.json').then(r => r.json()).then(setAccess).catch(() => {});
-    fetch('/data/zones/index.json').then(r => r.json()).then(setZonesIndex).catch(() => setZonesIndex({}));
+    fetchData(dataPath('tariffs.json')).then(setTariffs).catch(() => {});
+    fetchData(dataPath('access.json')).then(setAccess).catch(() => {});
+    fetchData(dataPath('zones/index.json')).then(setZonesIndex).catch(() => setZonesIndex({}));
   }, []);
 
   useEffect(() => {
-    fetch('/data/regions.json').then(r => r.json()).then(d => {
+    fetchData(dataPath('regions.json')).then(d => {
       for (const region of (d.regions || [])) {
         if (region.type === 'meta') continue; // meta-regions have no cache files
         const country = region.countries.find(c => c.iso === iso);
         if (country) {
           setInfo({ country, region });
           // Check GPPD and GEM availability for this region
-          fetch(`/data/cache/region_plants_${region.id}_gppd.geojson`, { method: 'HEAD' })
+          fetch(dataPath(`cache/region_plants_${region.id}_gppd.geojson`), { method: 'HEAD' })
             .then(r => setGppdAvailable(r.ok))
             .catch(() => setGppdAvailable(false));
-          fetch(`/data/cache/region_plants_${region.id}_gem.geojson`, { method: 'HEAD' })
+          fetch(dataPath(`cache/region_plants_${region.id}_gem.geojson`), { method: 'HEAD' })
             .then(r => setGemAvailable(r.ok))
             .catch(() => setGemAvailable(false));
           if (BRIEFS_ENABLED) {
-            fetch(`/data/notes/${iso}.html`, { method: 'HEAD' })
+            fetch(dataPath(`notes/${iso}.html`), { method: 'HEAD' })
               .then(r => setHasNote(r.ok))
               .catch(() => setHasNote(false));
           } else {
             setHasNote(false);
           }
-          fetch(`/data/market/${iso}.json`, { method: 'HEAD' })
+          fetch(dataPath(`market/${iso}.json`), { method: 'HEAD' })
             // Dev server (and some static hosts) return 200 + index.html for
             // any unmatched path, so r.ok alone can't tell a real JSON file
             // from the SPA fallback — only every country having a notes file
@@ -283,119 +247,78 @@ export default function CountryPage() {
       }
     });
     setFuelsOff(new Set()); setStatusOff(new Set()); setKvsOff(new Set());
-    setLinesOn(true); setPlantsOn(true); setSubsOn(false); setMinMw(100); setCircleScale(1.0);
+    setLinesOn(true); setPlantsOn(true); setSubsOn(false); setMinMw(100); setCircleScale(PLANT_CIRCLE_SCALE);
     setLcCircleScale(1.0);
-    setPlantSource('gem'); setGppdAvailable(null); setGemAvailable(null); setCountryCenter(null);
+    setPlantSource('gem'); setGppdAvailable(null); setGemAvailable(null);
     setZoneMode('plain'); setNZones(null); setZoneLabelsOn(false);
     setHasNote(null); setNoteOpen(false); setCountryReady(false);
     setMarketAvailable(null);
     mapReadyRef.current = false;
+    setMapReady(false);
     countryFeatureRef.current = null;
     track('country_view', { iso });
   }, [iso]);
 
   useEffect(() => {
-    if (!containerRef.current || !info) return;
+    if (!containerRef.current || !info || !wbBase) return;
     const { region } = info;
+    const tv = getT(theme);
+
+    let disposed = false;
+    // Start the map data now, alongside the basemap, not once the map is up.
+    const empty = () => ({ type: 'FeatureCollection', features: [] });
+    const plantsP = fetchData(dataPath(`cache/region_plants_${region.id}.geojson`));
+    const linesP  = fetchData(dataPath(`cache/region_lines_${region.id}.geojson`));
+    const subsP   = fetchData(dataPath(`cache/region_substations_${region.id}.geojson`)).catch(empty);
+    const lcP     = fetchData(dataPath(`region_load_centers_${region.id}.geojson`)).catch(empty);
+    const admin1P = fetchData(dataPath(`cache/region_admin1_${region.id}.geojson`)).catch(empty);
+    // Awaited later; until then a failure must not surface as unhandled.
+    plantsP.catch(() => {}); linesP.catch(() => {});
 
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: mapStyle(theme),
+      style: buildWbStyle(wbBase, tv, wbViewRef.current),
       center: [0, 20], zoom: 2,
       minZoom: 1, maxZoom: 16,
       attributionControl: false,
     });
     mapRef.current = map;
+    // Frame the country as soon as the (small, cached) bbox file is in, not
+    // after the style and every data layer have loaded (see RegionPage).
+    fetchBboxes().then(bboxes => {
+      const bounds = boundsFor(bboxes, 'countries', iso, 0.8);
+      if (disposed || !bounds) return;
+      map.fitBounds(bounds, { padding: 60, duration: 0, maxZoom: 9 });
+    }).catch(err => console.error('bboxes', err));
 
     const popup = new maplibregl.Popup({
       closeButton: false, closeOnClick: false, offset: 10,
       className: `popup-${theme}`,
     });
 
-    map.on('load', async () => {
-      const [countries, boundaries, plantsGJ, linesGJ, subsGJ, lcGJ, admin1GJ] = await Promise.all([
-        fetchCountries('10m'),
-        fetchBoundaries('10m'),
-        fetch(`/data/cache/region_plants_${region.id}.geojson`).then(r => r.json()),
-        fetch(`/data/cache/region_lines_${region.id}.geojson`).then(r => r.json()),
-        fetch(`/data/cache/region_substations_${region.id}.geojson`).then(r => r.json()).catch(() => ({ type: 'FeatureCollection', features: [] })),
-        fetch(`/data/region_load_centers_${region.id}.geojson`).then(r => r.json()).catch(() => ({ type: 'FeatureCollection', features: [] })),
-        fetch(`/data/cache/region_admin1_${region.id}.geojson`).then(r => r.ok ? r.json() : { type: 'FeatureCollection', features: [] }).catch(() => ({ type: 'FeatureCollection', features: [] })),
-      ]);
+    // On the style, not 'load': 'load' waits for every basemap tile and font to
+    // arrive and draw. The country's highlight goes on as soon as its geometry is
+    // in; plants, lines, substations, load centres and provinces start empty and
+    // fill in as each file arrives (see the end of this handler).
+    map.once('style.load', async () => {
+      const [countries, ndlsa] = await Promise.all([fetchGeo('country', iso), fetchNdlsa()]);
 
-      const bounds = fitBoundsCountry(iso, countries);
-      if (bounds) {
-        map.fitBounds(bounds, { padding: 60, duration: 0, maxZoom: 9 });
-        setCountryCenter({
-          lon: (bounds[0][0] + bounds[1][0]) / 2,
-          lat: (bounds[0][1] + bounds[1][1]) / 2,
-        });
-      }
+      if (disposed) return;
 
-      // Filter plants strictly inside the country polygon (point-in-polygon)
-      // Lines filtered by bbox (segments cross borders by nature)
+      // Plants, substations and load centres are kept strictly inside the country
+      // polygon (point-in-polygon); lines are kept if any vertex is inside, since
+      // segments cross borders by nature.
       const countryFeature = countries.features.find(f => f.properties.ISO_A3 === iso);
       countryFeatureRef.current = countryFeature || null;
-      setCountryReady(true);
-      let filteredPlants = plantsGJ;
-      let filteredLines  = linesGJ;
-      let filteredSubs   = subsGJ;
-      if (countryFeature) {
-        filteredPlants = {
-          ...plantsGJ,
-          features: plantsGJ.features.filter(f =>
-            pointInFeature(f.geometry.coordinates, countryFeature)
-          ),
-        };
-        filteredLines = {
-          ...linesGJ,
-          features: linesGJ.features.filter(f =>
-            f.geometry.coordinates.some(coord => pointInFeature(coord, countryFeature))
-          ),
-        };
-        filteredSubs = {
-          ...subsGJ,
-          features: subsGJ.features.filter(f =>
-            pointInFeature(f.geometry.coordinates, countryFeature)
-          ),
-        };
-      }
-
-      setFilteredPlantsData(filteredPlants);
-      setFilteredLinesData(filteredLines);
-      // Slider floor comes from the data itself: regions.yaml sets a different
-      // min_kv per region, and this way the UI never promises voltages the file
-      // doesn't hold.
-      const taggedKv = filteredLines.features
-        .map(f => f.properties.v)
-        .filter(v => v > 0);
-      const floorKv = taggedKv.length ? Math.floor(Math.min(...taggedKv) / 1000) : 110;
-      setKvFloor(floorKv);
-      // A theme switch rebuilds the map from scratch; keep whatever the slider
-      // was set to as long as the new data can honour it, and only fall back to
-      // the floor when it can't (first load, or a region with a higher floor).
-      setMinKv(kv => (kv >= floorKv && kv <= 500 ? kv : floorKv));
-      // Regions with a 110 kV floor hold no 33-110 kV and no untagged lines;
-      // an empty legend row would just be a dead checkbox.
-      setPresentKvs(new Set(filteredLines.features.map(f => bracketFor(f.properties.v).key)));
-
-      // Adaptive default min-MW: show all of a small country (e.g. Madagascar),
-      // cap big ones to the ~150 largest. Replaces the flat 100 MW default.
-      const adaptMin = adaptiveMinMw(filteredPlants.features, 150);
-      adaptiveMinRef.current = adaptMin;
-      setMinMw(adaptMin);
-
-      const filteredLc = {
-        ...lcGJ,
-        features: lcGJ.features.filter(f => f.properties.iso === iso),
-      };
+      const inCountry = (fc, keep) => (countryFeature
+        ? { ...fc, features: fc.features.filter(keep) } : fc);
 
       addCountriesSource(map, countries);
-      map.addSource('plants',       { type: 'geojson', data: filteredPlants });
-      map.addSource('lines',        { type: 'geojson', data: filteredLines  });
-      map.addSource('substations',  { type: 'geojson', data: filteredSubs   });
-      map.addSource('load-centers', { type: 'geojson', data: filteredLc     });
-      map.addSource('admin1',       { type: 'geojson', data: admin1GJ       });
+      map.addSource('plants',       { type: 'geojson', data: empty() });
+      map.addSource('lines',        { type: 'geojson', data: empty() });
+      map.addSource('substations',  { type: 'geojson', data: empty() });
+      map.addSource('load-centers', { type: 'geojson', data: empty() });
+      map.addSource('admin1',       { type: 'geojson', data: empty() });
       const hlFilter = ['==', ['get', 'ISO_A3'], iso];
       map.addSource('zone-fills',        { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addSource('zone-lines',        { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
@@ -403,9 +326,6 @@ export default function CountryPage() {
       map.addSource('zone-centroids-src', { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
       map.addSource('zone-outside',       { type: 'geojson', data: { type: 'FeatureCollection', features: [] } });
 
-      const tv = getT(theme);
-
-      addBaseLayers(map, tv, boundaries);
 
       // Transmission lines
       for (const bracket of VOLTAGE_BRACKETS) {
@@ -430,7 +350,11 @@ export default function CountryPage() {
         source: 'countries',
         filter: hlFilter,
         paint: { 'fill-color': hl.fill, 'fill-opacity': 0.08 },
-      });
+      }, fillAnchor(map));
+      // The country takes the highlight; a non-determined area it is party to
+      // comes out at half strength, see ndlsaFill(). Outlines come from the basemap.
+      addNdlsaLayer(map, { ndlsa, colorForIso: c => (c === iso ? hl.fill : null),
+        opacity: 0.08, before: fillAnchor(map), t: tv });
 
       // Admin-1 province/state boundaries (shown in 'admin' zone mode)
       map.addLayer({
@@ -446,43 +370,7 @@ export default function CountryPage() {
         paint: { 'line-color': '#5577aa', 'line-width': 0.7, 'line-opacity': 0.35 },
       });
 
-      // Plants
-      const fuels = new Set();
-      for (const f of plantsGJ.features) {
-        const fuel = f.properties.fuel;
-        if (fuel && FUEL_COLORS[fuel]) fuels.add(fuel);
-      }
-      setPresentFuels(fuels);
-
-      for (const [fuel, color] of Object.entries(FUEL_COLORS)) {
-        if (!fuels.has(fuel)) continue;
-        map.addLayer({
-          id: `plants-${fuel}`,
-          type: 'circle',
-          source: 'plants',
-          filter: buildPlantFilter(fuel, adaptMin, new Set(['planned'])),
-          paint: {
-            'circle-radius':  plantRadiusExpr(),
-            'circle-color':   color,
-            'circle-opacity': 0.90,
-            'circle-stroke-width': 0.6,
-            'circle-stroke-color': 'rgba(0,0,0,0.3)',
-          },
-        });
-
-        map.on('mouseenter', `plants-${fuel}`, e => {
-          map.getCanvas().style.cursor = 'pointer';
-          const p = e.features[0].properties;
-          const name = p.name ? `<b>${p.name}</b><br>` : '';
-          popup
-            .setLngLat(e.features[0].geometry.coordinates)
-            .setHTML(`${name}<span style="opacity:.75">${fuel} · ${p.mw} MW</span>`)
-            .addTo(map);
-        });
-        map.on('mouseleave', `plants-${fuel}`, () => {
-          map.getCanvas().style.cursor = ''; popup.remove();
-        });
-      }
+      // Plant layers, one per fuel present, are added once the plant file is in.
 
       // ── Substations (tiny dimgrey squares via custom image) ──────────────────
       const sqSz = 5;
@@ -514,11 +402,14 @@ export default function CountryPage() {
           clickedPoint = true;
           const p = e.features[0].properties;
           setSelFeature({ type: 'plant', props: { ...p, fuel } });
+          track('map_feature_click', { kind: 'plant', name: p.name, fuel, status: p.status, mw: p.mw, iso });
         });
       }
       map.on('click', 'substations', e => {
         clickedPoint = true;
-        setSelFeature({ type: 'substation', props: e.features[0].properties });
+        const p = e.features[0].properties;
+        setSelFeature({ type: 'substation', props: p });
+        track('map_feature_click', { kind: 'substation', name: p.name, iso });
       });
       const LINE_LAYERS = VOLTAGE_BRACKETS.map(b => `lines-${b.key}`);
 
@@ -570,6 +461,12 @@ export default function CountryPage() {
             props: { ...props, voltageLabel: v ? `${Math.round(v / 1000)} kV` : bracket.label },
             km:    lineKm(coords),
           });
+          track('map_feature_click', { kind: 'line', name: props.nm, kv: v ? Math.round(v / 1000) : undefined, iso });
+        } else if (countryFeatureRef.current
+            && !pointInFeature([e.lngLat.lng, e.lngLat.lat], countryFeatureRef.current)) {
+          // A click outside the country goes back out to its region.
+          track('map_feature_click', { kind: 'region', region: region.id, iso });
+          navigate(`/region/${region.id}`);
         } else {
           setSelFeature(null);
         }
@@ -596,7 +493,7 @@ export default function CountryPage() {
         id: 'zone-outside-labels', type: 'symbol', source: 'zone-outside',
         layout: {
           visibility: 'none',
-          'text-field': ['get', 'zone_name'],
+          'text-font': MAP_LABEL_FONT, 'text-field': ['get', 'zone_name'],
           'text-size': 10,
           'text-anchor': 'center',
           'text-allow-overlap': false,
@@ -634,7 +531,7 @@ export default function CountryPage() {
         id: 'zone-labels', type: 'symbol', source: 'zone-fills',
         layout: {
           visibility: 'none',
-          'text-field': ['get', 'zone_name'],
+          'text-font': MAP_LABEL_FONT, 'text-field': ['get', 'zone_name'],
           'text-size': 11,
           'text-anchor': 'center',
           'text-allow-overlap': true,
@@ -664,7 +561,7 @@ export default function CountryPage() {
         filter: ['!', ['in', ['get', 'status'], ['literal', ['planned', 'candidate', 'long_term']]]],
         layout: {
           visibility: 'none',
-          'text-field': ['get', 'label'],
+          'text-font': MAP_LABEL_FONT, 'text-field': ['get', 'label'],
           'text-size': 9,
           'symbol-placement': 'line-center',
           'text-allow-overlap': false,
@@ -685,13 +582,15 @@ export default function CountryPage() {
         },
       });
 
-      // Country border on top of zone layers so it always covers zone outer edges
+      // A soft glow over the zones' outer edges, not a border: the WB boundary
+      // line is lifted above it, and a crisp generalised edge beside that line
+      // would read as a second, wobbly border.
       map.addLayer({
         id: 'country-border',
         type: 'line',
         source: 'countries',
         filter: hlFilter,
-        paint: { 'line-color': hl.border, 'line-width': hl.borderW + 0.4, 'line-opacity': 0.95 },
+        paint: { 'line-color': hl.border, 'line-width': hl.borderW + 3, 'line-blur': 2.5, 'line-opacity': 0.45 },
       });
 
       // ── Load centers ─────────────────────────────────────────────────────────
@@ -710,7 +609,7 @@ export default function CountryPage() {
         id: 'load-centers-labels', type: 'symbol', source: 'load-centers',
         filter: ['>=', ['get', 'pop'], 300_000],
         layout: {
-          'text-field': ['get', 'name'],
+          'text-font': MAP_LABEL_FONT, 'text-field': ['get', 'name'],
           'text-size': 9,
           'text-offset': [0, 1.3],
           'text-anchor': 'top',
@@ -732,27 +631,119 @@ export default function CountryPage() {
       });
       map.on('mouseleave', 'load-centers', () => { map.getCanvas().style.cursor = ''; popup.remove(); });
 
-      mapReadyRef.current = true;
-
       raiseBoundaries(map);
+      // Anything toggled while the map was still loading. applyWbView() needs
+      // the basemap fully in, which 'style.load' does not wait for.
+      map.once('idle', () => { if (!disposed) applyWbView(map, wbViewRef.current); });
+
+      // ── Data layers, each filled as its file arrives ─────────────────────
+      const lines = linesP.then(linesGJ => {
+        if (disposed) return;
+        const filteredLines = inCountry(linesGJ, f =>
+          f.geometry.coordinates.some(coord => pointInFeature(coord, countryFeature)));
+        setFilteredLinesData(filteredLines);
+        // Slider floor comes from the data itself: regions.yaml sets a different
+        // min_kv per region, and this way the UI never promises voltages the file
+        // doesn't hold.
+        const taggedKv = filteredLines.features
+          .map(f => f.properties.v)
+          .filter(v => v > 0);
+        const floorKv = taggedKv.length ? Math.floor(Math.min(...taggedKv) / 1000) : 110;
+        setKvFloor(floorKv);
+        // A theme switch rebuilds the map from scratch; keep whatever the slider
+        // was set to as long as the new data can honour it, and only fall back to
+        // the floor when it can't (first load, or a region with a higher floor).
+        setMinKv(kv => (kv >= floorKv && kv <= 500 ? kv : floorKv));
+        // Regions with a 110 kV floor hold no 33-110 kV and no untagged lines;
+        // an empty legend row would just be a dead checkbox.
+        setPresentKvs(new Set(filteredLines.features.map(f => bracketFor(f.properties.v).key)));
+        map.getSource('lines')?.setData(filteredLines);
+      });
+      const plants = plantsP.then(plantsGJ => {
+        if (disposed) return;
+        const filteredPlants = inCountry(plantsGJ, f => pointInFeature(f.geometry.coordinates, countryFeature));
+        setFilteredPlantsData(filteredPlants);
+        // Adaptive default min-MW: show all of a small country (e.g. Madagascar),
+        // cap big ones to the ~150 largest. Replaces the flat 100 MW default.
+        const adaptMin = adaptiveMinMw(filteredPlants.features, 150);
+        adaptiveMinRef.current = adaptMin;
+        setMinMw(adaptMin);
+        map.getSource('plants')?.setData(filteredPlants);
+        const fuels = new Set();
+        for (const f of plantsGJ.features) {
+          const fuel = f.properties.fuel;
+          if (fuel && FUEL_COLORS[fuel]) fuels.add(fuel);
+        }
+        setPresentFuels(fuels);
+
+        // One layer per fuel present, slotted below the substations, where they
+        // stood when they were added up front.
+        for (const [fuel, color] of Object.entries(FUEL_COLORS)) {
+          if (!fuels.has(fuel)) continue;
+          map.addLayer({
+            id: `plants-${fuel}`,
+            type: 'circle',
+            source: 'plants',
+            filter: buildPlantFilter(fuel, adaptMin, new Set(['planned'])),
+            paint: {
+              'circle-radius':  plantRadiusExpr(PLANT_CIRCLE_SCALE),
+              'circle-color':   color,
+              'circle-opacity': 0.90,
+              'circle-stroke-width': 0.6,
+              'circle-stroke-color': 'rgba(0,0,0,0.3)',
+            },
+          }, 'substations');
+
+          map.on('mouseenter', `plants-${fuel}`, e => {
+            map.getCanvas().style.cursor = 'pointer';
+            const p = e.features[0].properties;
+            const name = p.name ? `<b>${p.name}</b><br>` : '';
+            popup
+              .setLngLat(e.features[0].geometry.coordinates)
+              .setHTML(`${name}<span style="opacity:.75">${fuel} · ${p.mw} MW</span>`)
+              .addTo(map);
+          });
+          map.on('mouseleave', `plants-${fuel}`, () => {
+            map.getCanvas().style.cursor = ''; popup.remove();
+          });
+        }
+        // The plant-source swap reads this: it may now replace these plants.
+        setCountryReady(true);
+      });
+      const subs = subsP.then(subsGJ => {
+        if (!disposed) map.getSource('substations')?.setData(
+          inCountry(subsGJ, f => pointInFeature(f.geometry.coordinates, countryFeature)));
+      });
+      const lcs = lcP.then(lcGJ => {
+        if (!disposed) map.getSource('load-centers')?.setData(
+          { ...lcGJ, features: lcGJ.features.filter(f => f.properties.iso === iso) });
+      });
+      const provinces = admin1P.then(gj => { if (!disposed) map.getSource('admin1')?.setData(gj); });
+      const results = await Promise.allSettled([plants, lines, subs, lcs, provinces]);
+      for (const r of results) if (r.status === 'rejected') console.error('country map data', r.reason);
+      if (disposed) return;
+      mapReadyRef.current = true;
+      setMapReady(true);
     });
 
-    return () => { mapReadyRef.current = false; popup.remove(); mapRef.current?.remove(); };
-  }, [info, theme]);
+    return () => {
+      disposed = true;
+      mapReadyRef.current = false;
+      setMapReady(false);
+      popup.remove();
+      mapRef.current?.remove();
+      mapRef.current = null;
+    };
+  }, [info, theme, wbBase]);
 
   // ── Basemap switcher ─────────────────────────────────────────────────────
+  // The initial view is baked into the style; later changes are applied live.
   useEffect(() => {
+    wbViewRef.current = wbView;
     const map = mapRef.current;
-    if (!map) return;
-    swapBasemap(map, basemap, theme);
-    if (basemap !== 'satellite') toggleSatLabels(map, false, theme);
-  }, [basemap, theme]);
-
-  useEffect(() => {
-    const map = mapRef.current;
-    if (!map || basemap !== 'satellite') return;
-    toggleSatLabels(map, satLabels, theme);
-  }, [satLabels, basemap, theme]);
+    if (!map || !mapReadyRef.current) return;
+    applyWbView(map, wbView);
+  }, [wbView]);
 
   // ── Layer toggle handlers ────────────────────────────────────────────────
 
@@ -763,9 +754,10 @@ export default function CountryPage() {
       const next = new Set(prev);
       if (next.has(fuel)) { next.delete(fuel); map.setLayoutProperty(`plants-${fuel}`, 'visibility', 'visible'); }
       else                { next.add(fuel);    map.setLayoutProperty(`plants-${fuel}`, 'visibility', 'none');    }
+      track('filter_change', { filter: 'fuel', value: fuel, on: !next.has(fuel), iso });
       return next;
     });
-  }, []);
+  }, [iso]);
 
   const toggleKv = useCallback(key => {
     const map = mapRef.current;
@@ -774,9 +766,10 @@ export default function CountryPage() {
       const next = new Set(prev);
       if (next.has(key)) { next.delete(key); map.setLayoutProperty(`lines-${key}`, 'visibility', 'visible'); }
       else               { next.add(key);    map.setLayoutProperty(`lines-${key}`, 'visibility', 'none');    }
+      track('filter_change', { filter: 'voltage', value: key, on: !next.has(key), iso });
       return next;
     });
-  }, []);
+  }, [iso]);
 
   const toggleLines = useCallback(() => {
     const map = mapRef.current;
@@ -786,9 +779,10 @@ export default function CountryPage() {
       for (const { key } of VOLTAGE_BRACKETS)
         if (!kvsOff.has(key) && map.getLayer(`lines-${key}`))
           map.setLayoutProperty(`lines-${key}`, 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'lines', value: next, iso });
       return next;
     });
-  }, [kvsOff]);
+  }, [kvsOff, iso]);
 
   const togglePlants = useCallback(() => {
     const map = mapRef.current;
@@ -798,9 +792,10 @@ export default function CountryPage() {
       for (const fuel of presentFuels)
         if (!fuelsOff.has(fuel) && map.getLayer(`plants-${fuel}`))
           map.setLayoutProperty(`plants-${fuel}`, 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'plants', value: next, iso });
       return next;
     });
-  }, [presentFuels, fuelsOff]);
+  }, [presentFuels, fuelsOff, iso]);
 
   const toggleSubs = useCallback(() => {
     const map = mapRef.current;
@@ -808,9 +803,10 @@ export default function CountryPage() {
     setSubsOn(prev => {
       const next = !prev;
       map.setLayoutProperty('substations', 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'substations', value: next, iso });
       return next;
     });
-  }, []);
+  }, [iso]);
 
   const toggleStatus = useCallback(status => {
     const map = mapRef.current;
@@ -818,13 +814,14 @@ export default function CountryPage() {
     setStatusOff(prev => {
       const next = new Set(prev);
       next.has(status) ? next.delete(status) : next.add(status);
+      track('filter_change', { filter: 'status', value: status, on: !next.has(status), iso });
       for (const fuel of Object.keys(FUEL_COLORS)) {
         if (!map.getLayer(`plants-${fuel}`)) continue;
         map.setFilter(`plants-${fuel}`, buildPlantFilter(fuel, minMw, next));
       }
       return next;
     });
-  }, [minMw]);
+  }, [minMw, iso]);
 
   const toggleLoadCenters = useCallback(() => {
     const map = mapRef.current;
@@ -834,9 +831,10 @@ export default function CountryPage() {
       for (const id of ['load-centers', 'load-centers-labels']) {
         if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', next ? 'visible' : 'none');
       }
+      track('map_option_change', { option: 'load_centers', value: next, iso });
       return next;
     });
-  }, []);
+  }, [iso]);
 
   const toggleZoneLabels = useCallback(() => {
     const map = mapRef.current;
@@ -844,9 +842,10 @@ export default function CountryPage() {
     setZoneLabelsOn(prev => {
       const next = !prev;
       map.setLayoutProperty('zone-labels', 'visibility', next ? 'visible' : 'none');
+      track('map_option_change', { option: 'zone_labels', value: next, iso });
       return next;
     });
-  }, []);
+  }, [iso]);
 
   const toggleZoneCorridors = useCallback(() => {
     const map = mapRef.current;
@@ -856,9 +855,10 @@ export default function CountryPage() {
       for (const id of ['zone-corridors-ex', 'zone-corridors-labels', 'zone-corridors-dots']) {
         if (map.getLayer(id)) map.setLayoutProperty(id, 'visibility', next ? 'visible' : 'none');
       }
+      track('map_option_change', { option: 'zone_corridors', value: next, iso });
       return next;
     });
-  }, []);
+  }, [iso]);
 
   const handleLcMinPop = useCallback(pop => {
     const map = mapRef.current;
@@ -928,13 +928,15 @@ export default function CountryPage() {
     const label = `${iso}_${nZones}z`;
 
     Promise.all([
-      fetch(`/data/zones/${label}_zones.geojson`).then(r => r.ok ? r.json() : null).catch(() => null),
-      fetch(`/data/zones/${label}_topo.json`).then(r => r.ok ? r.json() : []).catch(() => []),
-      fetch(`/data/zones/${label}_corridors.geojson`).then(r => r.ok ? r.json() : null).catch(() => null),
-      fetch(`/data/zones/${label}_outside.geojson`).then(r => r.ok ? r.json() : null).catch(() => null),
-    ]).then(([zonesGJ, topo, corridorsGJ, outsideGJ]) => {
-      if (!zonesGJ || !map.getSource('zone-fills')) return;
-      zonesGJ.features.forEach((f, i) => { f.properties.color = COLORS[i % COLORS.length]; });
+      fetchData(dataPath(`zones/${label}_zones.geojson`)).catch(() => null),
+      fetchData(dataPath(`zones/${label}_topo.json`)).catch(() => []),
+      fetchData(dataPath(`zones/${label}_corridors.geojson`)).catch(() => null),
+      fetchData(dataPath(`zones/${label}_outside.geojson`)).catch(() => null),
+    ]).then(([zonesFile, topo, corridorsGJ, outsideGJ]) => {
+      if (!zonesFile || !map.getSource('zone-fills')) return;
+      // Colour a copy: the parsed file is shared through the data cache.
+      const zonesGJ = { ...zonesFile, features: zonesFile.features.map((f, i) =>
+        ({ ...f, properties: { ...f.properties, color: COLORS[i % COLORS.length] } })) };
       map.getSource('zone-fills').setData(zonesGJ);
 
       // Build interzone line geometries from centroids
@@ -1003,8 +1005,7 @@ export default function CountryPage() {
     if (!map?.getSource('plants') || !info || !countryReady) return;
     const suffix = plantSource === 'gppd' ? '_gppd' : plantSource === 'gem' ? '_gem' : '';
     const filename = `region_plants_${info.region.id}${suffix}.geojson`;
-    fetch(`/data/cache/${filename}`)
-      .then(r => { if (!r.ok) throw new Error(); return r.json(); })
+    fetchData(dataPath(`cache/${filename}`))
       .then(data => {
         const cf = countryFeatureRef.current;
         const filtered = {
@@ -1028,11 +1029,11 @@ export default function CountryPage() {
     if (!info) return;
     setCapacity(null);
     const capSuffix = plantSource === 'gppd' ? '_gppd' : plantSource === 'gem' ? '_gem' : '';
-    const baseUrl    = `/data/cache/region_capacity_${info.region.id}.json`;
-    const primaryUrl = capSuffix ? `/data/cache/region_capacity_${info.region.id}${capSuffix}.json` : null;
+    const baseUrl    = dataPath(`cache/region_capacity_${info.region.id}.json`);
+    const primaryUrl = capSuffix ? dataPath(`cache/region_capacity_${info.region.id}${capSuffix}.json`) : null;
     Promise.all([
-      fetch(baseUrl).then(r => r.json()).catch(() => null),
-      primaryUrl ? fetch(primaryUrl).then(r => r.json()).catch(() => null) : Promise.resolve(null),
+      fetchData(baseUrl).catch(() => null),
+      primaryUrl ? fetchData(primaryUrl).catch(() => null) : Promise.resolve(null),
     ]).then(([base, primary]) => {
       if (!base && !primary) return;
       if (!primary) { setCapacity(base); return; }
@@ -1046,8 +1047,7 @@ export default function CountryPage() {
   useEffect(() => {
     setFleetAge(null);
     if (!info || plantSource !== 'gppd') return;
-    fetch(`/data/cache/region_age_${info.region.id}_gppd.json`)
-      .then(r => r.ok ? r.json() : null)
+    fetchData(dataPath(`cache/region_age_${info.region.id}_gppd.json`)).catch(() => null)
       .then(setFleetAge)
       .catch(() => setFleetAge(null));
   }, [plantSource, info]);
@@ -1115,10 +1115,20 @@ export default function CountryPage() {
     setMinKv(kv);
     applyMinKv(kv, false);
     clearTimeout(minKvCommitRef.current);
-    minKvCommitRef.current = setTimeout(() => applyMinKv(kv, true), 250);
-  }, [applyMinKv]);
+    minKvCommitRef.current = setTimeout(() => {
+      applyMinKv(kv, true);
+      track('filter_change', { filter: 'min_kv', value: kv, iso });
+    }, 250);
+  }, [applyMinKv, iso]);
 
   useEffect(() => () => clearTimeout(minKvCommitRef.current), []);
+
+  // The basemap panel hands back the whole view; report the one field that changed.
+  const changeWbView = useCallback(next => {
+    setWbView(next);
+    const option = Object.keys(next).find(k => next[k] !== wbView[k]);
+    if (option) track('map_option_change', { option, value: next[option], iso });
+  }, [wbView, iso]);
 
   const handleDownloadLines = useCallback((format = 'geojson') => {
     if (!filteredLinesData) return;
@@ -1140,12 +1150,12 @@ export default function CountryPage() {
 
   return (
     <div style={{ display: 'flex', height: 'calc(100vh - 46px)', position: 'relative' }}
-      onMouseMove={e => { if (!isDrRef.current) return; setPanelWidth(w => Math.max(PANEL_WIDTH_MIN, Math.min(PANEL_WIDTH_MAX, drStartW.current + (drStartX.current - e.clientX)))); }}
+      onMouseMove={e => { if (!isDrRef.current) return; setPanelWidth(Math.max(PANEL_WIDTH_MIN, Math.min(PANEL_WIDTH_MAX, drStartW.current + (drStartX.current - e.clientX)))); }}
       onMouseUp={() => { isDrRef.current = false; }}
       onMouseLeave={() => { isDrRef.current = false; }}
     >
-      <MapChat mapRef={mapRef} mapKey={mapRef.current} ready={!!info} controller={{
-        page: 'country', iso, regionId: info.region?.id, tab: activeTab, navigate,
+      <MapChat theme={theme} mapRef={mapRef} ready={mapReady} controller={{
+        page: 'country', iso, regionId: region?.id, tab: activeTab, navigate,
         setTab: setActiveTab, setPlantSource, setMinMw: handleMinMw,
         showOnlyFuels: fuels => { for (const f of presentFuels) if (fuelsOff.has(f) === fuels.includes(f)) toggleFuel(f); },
       }} />
@@ -1165,8 +1175,9 @@ export default function CountryPage() {
         linesOn={linesOn} plantsOn={plantsOn} subsOn={subsOn}
         minMw={minMw} circleScale={circleScale}
         plantSource={plantSource} gppdAvailable={gppdAvailable} gemAvailable={gemAvailable} regionId={region.id} iso={iso}
+        gridNote={region.grid_note}
         presentFuels={presentFuels}
-        basemap={basemap} onBasemap={setBasemap} satLabels={satLabels} onSatLabels={setSatLabels}
+        wbView={wbView} onWbView={changeWbView}
         onToggleFuel={toggleFuel} onToggleStatus={toggleStatus} onToggleKv={toggleKv}
         onToggleLines={toggleLines} onTogglePlants={togglePlants}
         onToggleSubs={toggleSubs}
@@ -1207,7 +1218,10 @@ export default function CountryPage() {
 
         {isMobile && (
           <div style={{
-            position: 'absolute', top: 10, right: 12, zIndex: 5,
+            // The zone selector takes the top-right corner when a country has
+            // zones; the hint then drops under the Legend & Filter button.
+            position: 'absolute', zIndex: 5,
+            ...(zonesIndex !== null ? { top: 56, left: 12 } : { top: 10, right: 12 }),
             backgroundColor: t.panel, border: `1px solid ${t.panelBorder}`,
             borderRadius: 6, padding: '8px 12px',
             boxShadow: '0 1px 6px rgba(0,0,0,.2)',
@@ -1237,6 +1251,7 @@ export default function CountryPage() {
                   <button key={mode} disabled={disabled}
                     onClick={() => {
                       setZoneMode(mode);
+                      track('map_option_change', { option: 'zones', value: mode, iso });
                       if (mode === 'modeling' && !nZones && zonesIndex[iso]?.length) {
                         setNZones(defaultNZones(zonesIndex[iso]));
                       }
@@ -1376,6 +1391,23 @@ export default function CountryPage() {
           </div>
         )}
 
+        {/* Back to the world view, and the Equal Earth export — top-left of the
+            map (under Legend & Filter on phones) */}
+        <div style={{
+          position: 'absolute', zIndex: 60, display: 'flex', alignItems: 'flex-start', gap: 6,
+          ...(isMobile ? { top: zonesIndex !== null ? 112 : 56, left: 12 } : { top: 10, left: 12 }),
+        }}>
+          <WorldButton t={t} compact={isMobile} />
+          <ExportControl
+            mapRef={mapRef} ready={mapReady} t={t} compact={isMobile}
+            style={{ position: 'relative', left: 0 }}
+            title={`Regional Power Explorer — ${country.name}`}
+            fileName={`regional-power-explorer-${iso}`}
+            defaultBasemap={wbView.canvas}
+            legend={() => powerLegend({ presentFuels, fuelsOff, presentKvs, theme })}
+          />
+        </div>
+
         {/* ── Map disclaimer ── */}
         <div style={{
           position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)',
@@ -1385,7 +1417,7 @@ export default function CountryPage() {
           fontSize: '0.47rem', color: t.lblMuted, textAlign: 'center',
           whiteSpace: 'nowrap', letterSpacing: '0.3px',
         }}>
-          Pilot · Indicative data · Partly AI-generated, not fact-checked · Boundaries for reference only · Unofficial
+          Pilot
         </div>
       </div>
 
@@ -1450,7 +1482,7 @@ export default function CountryPage() {
             </div>
             <iframe
               ref={noteIframeRef}
-              src={`/data/notes/${iso}.html`}
+              src={dataPath(`notes/${iso}.html`)}
               title={`${country.name} – Sector Briefing Note`}
               style={{ flex: 1, border: 'none', width: '100%' }}
             />
@@ -1458,7 +1490,7 @@ export default function CountryPage() {
         </>
       )}
 
-      {/* ── Suggest-an-edit modal (posts to the Google Sheet via Apps Script) ── */}
+      {/* ── Suggest-an-edit modal (opens the visitor's email app) ── */}
       {editOpen && (
         <div onClick={() => setEditOpen(false)} style={{
           position: 'fixed', inset: 0, zIndex: 1000, backgroundColor: 'rgba(0,0,0,0.45)',
@@ -1471,7 +1503,7 @@ export default function CountryPage() {
           }}>
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'baseline', marginBottom: 4 }}>
               <h3 style={{ fontSize: '0.95rem', fontWeight: 700, color: '#1B2A4A', margin: 0 }}>Suggest an edit</h3>
-              <span style={{ fontSize: '0.62rem', color: '#5A6474' }}>{country?.name} · {iso}</span>
+              <span style={{ fontSize: '0.62rem', color: '#5A6474' }}><span style={isItalicName(country?.name) ? { fontStyle: 'italic' } : undefined}>{country?.name}</span> · {iso}</span>
             </div>
             <p style={{ fontSize: '0.66rem', color: '#5A6474', lineHeight: 1.5, margin: '0 0 12px' }}>
               Propose a correction to this briefing note. Tip: highlight text in the note before clicking to pre-fill the passage.
@@ -1479,7 +1511,8 @@ export default function CountryPage() {
 
             {editStatus === 'sent' ? (
               <div style={{ fontSize: '0.78rem', color: '#1f8a4c', padding: '14px 0' }}>
-                ✓ Thanks — your suggestion was sent.
+                Your email app should now be open with the suggestion ready to send. If it isn't,
+                write to {CONTACT_EMAIL}.
                 <div style={{ marginTop: 14 }}>
                   <button type="button" onClick={() => setEditOpen(false)} style={EDIT_BTN_PRIMARY}>Close</button>
                 </div>
@@ -1494,25 +1527,10 @@ export default function CountryPage() {
                 <textarea value={editForm.suggestion} onChange={e => setEditForm(f => ({ ...f, suggestion: e.target.value }))}
                   rows={4} required placeholder="What should it say / what's wrong?" style={EDIT_INP} />
 
-                <div style={{ display: 'flex', gap: 10 }}>
-                  <div style={{ flex: 1 }}>
-                    <label style={EDIT_LBL}>First name</label>
-                    <input value={editForm.firstName} onChange={e => setEditForm(f => ({ ...f, firstName: e.target.value }))} style={EDIT_INP} />
-                  </div>
-                  <div style={{ flex: 1 }}>
-                    <label style={EDIT_LBL}>Last name</label>
-                    <input value={editForm.lastName} onChange={e => setEditForm(f => ({ ...f, lastName: e.target.value }))} style={EDIT_INP} />
-                  </div>
-                </div>
-                <label style={EDIT_LBL}>Your email</label>
-                <input type="email" value={editForm.email} onChange={e => setEditForm(f => ({ ...f, email: e.target.value }))} style={EDIT_INP} />
-
-                {editStatus === 'error' && <div style={{ fontSize: '0.66rem', color: '#c0392b', marginTop: 8 }}>Something went wrong — please try again.</div>}
-
                 <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 16 }}>
                   <button type="button" onClick={() => setEditOpen(false)} style={EDIT_BTN_GHOST}>Cancel</button>
-                  <button type="submit" disabled={editStatus === 'sending' || !editForm.suggestion.trim()} style={EDIT_BTN_PRIMARY}>
-                    {editStatus === 'sending' ? 'Sending…' : 'Submit suggestion'}
+                  <button type="submit" disabled={!editForm.suggestion.trim()} style={EDIT_BTN_PRIMARY}>
+                    Submit suggestion
                   </button>
                 </div>
               </>
@@ -1559,7 +1577,7 @@ export default function CountryPage() {
               width: 44, height: 5, borderRadius: 3,
               backgroundColor: t.muted, opacity: 0.7,
             }} />
-            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: t.text }}>{country.name}</span>
+            <span style={{ fontSize: '0.85rem', fontWeight: 700, color: t.text, ...(isItalicName(country.name) ? { fontStyle: 'italic' } : {}) }}>{country.name}</span>
             <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
               <span style={{ fontSize: '0.82rem', fontWeight: 700, color: t.lbl, letterSpacing: '0.3px' }}>
                 {sheetHeight > 96 ? 'Close' : 'Data'}
@@ -1579,10 +1597,10 @@ export default function CountryPage() {
             <span style={{ color: t.panelBorder, fontSize: '0.68rem' }}>/</span>
             <Link to={`/region/${region.id}`} style={{ fontSize: '0.68rem', color: t.muted }}>{region.name}</Link>
             <span style={{ color: t.panelBorder, fontSize: '0.68rem' }}>/</span>
-            <span style={{ fontSize: '0.68rem', color: t.lbl, fontWeight: 600 }}>{country.name}</span>
+            <span style={{ fontSize: '0.68rem', color: t.lbl, fontWeight: 600, ...(isItalicName(country.name) ? { fontStyle: 'italic' } : {}) }}>{country.name}</span>
           </div>
 
-          <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: t.text, marginBottom: 6 }}>
+          <h2 style={{ fontSize: '1.1rem', fontWeight: 700, color: t.text, marginBottom: 6, ...(isItalicName(country.name) ? { fontStyle: 'italic' } : {}) }}>
             {country.name}
           </h2>
           <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
@@ -1626,7 +1644,7 @@ export default function CountryPage() {
             })}
             {hasNote && (
               <button
-                onClick={() => setNoteOpen(o => !o)}
+                onClick={() => { if (!noteOpen) track('note_open', { iso }); setNoteOpen(o => !o); }}
                 title="Open sector briefing note"
                 style={{
                   flex: 1, fontSize: TAB_FONT_SIZE, letterSpacing: TAB_LETTER_SPACING,
@@ -1714,7 +1732,7 @@ export default function CountryPage() {
           )}
 
           {activeTab === 're' && (
-            <REResourcesTab center={countryCenter} theme={theme} />
+            <REResourcesTab iso={iso} theme={theme} />
           )}
 
           {activeTab === 'load' && (
@@ -1725,7 +1743,10 @@ export default function CountryPage() {
             <ZoningTab
               iso={iso} theme={theme} regionId={region.id}
               nZones={nZones}
-              onSelectZones={(n) => { setZoneMode('modeling'); setNZones(n); }}
+              onSelectZones={(n) => {
+                setZoneMode('modeling'); setNZones(n);
+                track('map_option_change', { option: 'zones', value: 'modeling', zones: n, iso });
+              }}
             />
           )}
 

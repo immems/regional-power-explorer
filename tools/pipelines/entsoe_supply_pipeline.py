@@ -1,8 +1,15 @@
 """
 ENTSO-E supply + trade pipeline.
 
-Generates public/data/supply/{ISO3}.json and public/data/trade/{ISO3}.json
+Generates public/data/entsoe/{ISO3}.json and public/data/trade/{ISO3}.json
 for all ENTSO-E member countries.
+
+Capacity goes to entsoe/<ISO3>.json for the AI assistant's fuel_detail tool (its
+finer split: hydro run-of-river, reservoir and pumped storage; lignite and hard
+coal; onshore and offshore wind); the generation in those files comes from
+ENTSO-E's harmonised statistics (entsoe_stats_pipeline.py). The explorer's supply
+series come from Ember (public/data/methodology.md). Trade stays ENTSO-E's, with
+known problems under investigation (docs/TRADE_AUDIT.md).
 
 Data sources:
   Generation (GWh): A75 — Actual Generation per Production Type
@@ -37,11 +44,10 @@ from configparser import ConfigParser
 from pathlib import Path
 
 import pandas as pd
-from entsoe import EntsoePandasClient
 
 ROOT      = Path(__file__).resolve().parents[2]
 RAW       = ROOT / 'data-source' / 'raw' / 'ENTSOE'
-OUT       = ROOT / 'public' / 'data' / 'supply'
+OUT       = ROOT / 'public' / 'data' / 'entsoe'
 OUT_TRADE = ROOT / 'public' / 'data' / 'trade'
 
 YEARS = list(range(2015, 2025))
@@ -107,6 +113,13 @@ TRADE_AREA_OVERRIDES = {
     'DK': 'DK_1',
     'NO': 'NO_1',
     'SE': 'SE_3',
+}
+
+# Borders missing from entsoe-py's NEIGHBOURS map, queried one by one and
+# added to the all-borders frame. RO–MD carries 2 to 3 TWh of Romanian exports
+# a year since 2022 and is absent from entsoe-py 0.8.0.
+EXTRA_NEIGHBOURS = {
+    'RO': ['MD'],
 }
 
 # ── ENTSO-E production type → our fuel category ──────────────────────────────
@@ -377,20 +390,38 @@ def _fetch_xborder_year(client, iso2, year, direction, refresh):
     direction: 'exp' (outgoing) or 'imp' (incoming).
     """
     cache = RAW / f'xbor_{direction}_{iso2}_{year}.csv'
-    if cache.exists() and not refresh:
-        df = pd.read_csv(cache, index_col=0, parse_dates=True)
-        return _drop_sum_cols(df)
-
     start      = pd.Timestamp(f'{year}-01-01', tz=TZ)
     end        = pd.Timestamp(f'{year+1}-01-01', tz=TZ)
     code       = TRADE_AREA_OVERRIDES.get(iso2, iso2)
     export_dir = (direction == 'exp')
-    df = client.query_physical_crossborder_allborders(
-        code, start=start, end=end, export=export_dir
-    )
-    if not isinstance(df, pd.DataFrame):
-        df = pd.DataFrame(df)
-    df = _drop_sum_cols(df)
+    extras     = EXTRA_NEIGHBOURS.get(iso2, [])
+
+    if cache.exists() and not refresh:
+        df = _drop_sum_cols(pd.read_csv(cache, index_col=0, parse_dates=True))
+        missing = [n for n in extras if n not in df.columns]
+        if not missing:
+            return df
+    else:
+        df = client.query_physical_crossborder_allborders(
+            code, start=start, end=end, export=export_dir
+        )
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df)
+        df = _drop_sum_cols(df)
+        missing = extras
+
+    if missing:
+        df.index = pd.to_datetime(df.index, utc=True)
+        for neighbour in missing:
+            pair = (code, neighbour) if export_dir else (neighbour, code)
+            try:
+                flow = client.query_crossborder_flows(pair[0], pair[1], start=start, end=end)
+                flow.index = pd.to_datetime(flow.index, utc=True)
+                df = pd.concat([df, flow.rename(neighbour)], axis=1, sort=True)
+            except Exception as exc:
+                print(f'  trade {direction} {year} {neighbour}: SKIP ({exc})')
+                df[neighbour] = float('nan')
+
     RAW.mkdir(parents=True, exist_ok=True)
     df.to_csv(cache)
     return df
@@ -401,7 +432,12 @@ def _annual_xborder_gwh(client, iso2, year, direction, refresh):
     df = _fetch_xborder_year(client, iso2, year, direction, refresh)
     if df is None or df.empty or len(df) < 2:
         return {}
-    gwh = _to_gwh(df.clip(lower=0))
+    # Borders report at different resolutions (15 min on some, hourly on others),
+    # so the frame holds NaN between the hourly values. _to_gwh gives every row
+    # the frame's step and counted hourly borders at a quarter; an hourly mean
+    # per border is right for both.
+    df.index = pd.to_datetime(df.index, utc=True)
+    gwh = df.clip(lower=0).resample('1h').mean().sum() / 1000
     result = {}
     for col, val in gwh.items():
         if val <= 0:
@@ -544,11 +580,19 @@ def _build_country(client, iso2, iso3, name, refresh, with_trade=True):
             },
         }
 
+    # entsoe/<ISO3>.json keeps capacity only: generation comes from ENTSO-E's harmonised
+    # statistics (entsoe_stats_pipeline.py), and the supply series from Ember. Not for
+    # countries queried through one price zone (AREA_OVERRIDES other than DE_LU), whose
+    # capacity covers that zone only (docs/TRADE_AUDIT.md, finding 1).
     OUT.mkdir(parents=True, exist_ok=True)
     out_path = OUT / f'{iso3}.json'
-    with open(out_path, 'w', encoding='utf-8') as fh:
-        json.dump(supply, fh, indent=2, ensure_ascii=False)
-    print(f'  supply -> {out_path}')
+    one_zone = iso2 in AREA_OVERRIDES and iso2 != 'DE'
+    if 'capacity' in supply and not one_zone:
+        existing = json.loads(out_path.read_text(encoding='utf-8')) if out_path.exists() else {'country': name}
+        existing['capacity'] = supply['capacity']
+        with open(out_path, 'w', encoding='utf-8') as fh:
+            json.dump(existing, fh, indent=2, ensure_ascii=False)
+        print(f'  entsoe capacity -> {out_path}')
 
     if with_trade:
         _build_trade(client, iso2, iso3, name, refresh)
@@ -556,14 +600,18 @@ def _build_country(client, iso2, iso3, name, refresh, with_trade=True):
 
 # ── Entry point ───────────────────────────────────────────────────────────────
 
-def run(iso2_filter=None, refresh=False, with_trade=True):
+def run(iso2_filter=None, refresh=False, with_trade=True, trade_only=False):
     """Generate supply + trade JSONs for ENTSO-E countries.
 
     Args:
         iso2_filter: list of ISO2 codes to process (None = all)
         refresh:     re-download even if cache exists
         with_trade:  also generate trade/{ISO3}.json (default True)
+        trade_only:  only rebuild trade/{ISO3}.json, leave supply/ untouched
     """
+    # Imported here so other scripts can reuse this module's mappings without entsoe-py.
+    from entsoe import EntsoePandasClient
+
     RAW.mkdir(parents=True, exist_ok=True)
     token  = _load_token()
     client = EntsoePandasClient(api_key=token)
@@ -572,17 +620,22 @@ def run(iso2_filter=None, refresh=False, with_trade=True):
         k: v for k, v in COUNTRIES.items()
         if iso2_filter is None or k.upper() in {c.upper() for c in iso2_filter}
     }
-    print(f'Processing {len(targets)} countries  (refresh={refresh}, trade={with_trade})')
+    print(f'Processing {len(targets)} countries  (refresh={refresh}, trade={with_trade}, trade_only={trade_only})')
 
     for iso2, (iso3, name) in targets.items():
         try:
-            _build_country(client, iso2, iso3, name, refresh, with_trade=with_trade)
+            if trade_only:
+                print(f'\n[{iso2}] {name}')
+                _build_trade(client, iso2, iso3, name, refresh)
+            else:
+                _build_country(client, iso2, iso3, name, refresh, with_trade=with_trade)
         except Exception as exc:
             print(f'[{iso2}] FAILED: {exc}')
 
 
 if __name__ == '__main__':
-    args      = [a for a in sys.argv[1:] if not a.startswith('-')]
-    refresh   = '--refresh'  in sys.argv
-    no_trade  = '--no-trade' in sys.argv
-    run(iso2_filter=args or None, refresh=refresh, with_trade=not no_trade)
+    args       = [a for a in sys.argv[1:] if not a.startswith('-')]
+    refresh    = '--refresh'    in sys.argv
+    no_trade   = '--no-trade'   in sys.argv
+    trade_only = '--trade-only' in sys.argv
+    run(iso2_filter=args or None, refresh=refresh, with_trade=not no_trade, trade_only=trade_only)

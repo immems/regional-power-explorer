@@ -1,9 +1,12 @@
+import { dataPath } from '../utils/paths';
+import { fetchData } from '../utils/dataCache';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate, Link } from 'react-router-dom';
 import maplibregl from 'maplibre-gl';
 import { useTheme } from '../App';
-import { getT, mapStyle } from '../constants';
-import { fetchCountries, addCountriesSource } from '../utils/basemap';
+import { getT } from '../constants';
+import { buildWbStyle, useWbStyleBase } from '../utils/wbStyle';
+import { prefetchGeo, addGeoSource, countryLayer, raiseBoundaries, fillAnchor } from '../utils/basemap';
 
 export default function MetaRegionPage({ region }) {
   const { theme }  = useTheme();
@@ -15,36 +18,38 @@ export default function MetaRegionPage({ region }) {
   const [subregions, setSubregions] = useState([]);
 
   useEffect(() => {
-    fetch('/data/regions.json').then(r => r.json()).then(d => {
+    prefetchGeo('world');
+    fetchData(dataPath('regions.json')).then(d => {
       setSubregions((d.regions || []).filter(r => r.parent === region.id));
     });
   }, [region.id]);
 
+  const wbBase = useWbStyleBase();
+
   useEffect(() => {
-    if (!containerRef.current || subregions.length === 0) return;
+    if (!containerRef.current || subregions.length === 0 || !wbBase) return;
 
     const allIsos = region.countries.map(c => c.iso);
 
+    let disposed = false;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: mapStyle(theme),
+      style: buildWbStyle(wbBase, t),
       center: [20, 5], zoom: 1.8,
       minZoom: 1, maxZoom: 6,
       attributionControl: false,
     });
     mapRef.current = map;
 
-    map.on('load', async () => {
-      const countries = await fetchCountries('110m');
-      addCountriesSource(map, countries);
-      map.addLayer({ id: 'sids-fill', type: 'fill', source: 'countries',
+    // On the style, not 'load', which waits for every basemap tile to draw.
+    map.once('style.load', async () => {
+      const mode = await addGeoSource(map, 'world', undefined, () => disposed);
+      if (!mode) return;
+      map.addLayer({ id: 'sids-fill', type: 'fill', ...countryLayer(mode),
         filter: ['in', ['get', 'ISO_A3'], ['literal', allIsos]],
         paint: { 'fill-color': region.color, 'fill-opacity': 0.18 },
-      });
-      map.addLayer({ id: 'sids-border', type: 'line', source: 'countries',
-        filter: ['in', ['get', 'ISO_A3'], ['literal', allIsos]],
-        paint: { 'line-color': region.color, 'line-width': 1.2, 'line-opacity': 0.6 },
-      });
+      }, fillAnchor(map));
+      raiseBoundaries(map);
 
       markersRef.current = subregions.map(sub => {
         const el = document.createElement('div');
@@ -65,11 +70,13 @@ export default function MetaRegionPage({ region }) {
     });
 
     return () => {
+      disposed = true;
       markersRef.current.forEach(m => m.remove());
       markersRef.current = [];
       mapRef.current?.remove();
+      mapRef.current = null;
     };
-  }, [subregions, region, theme]);
+  }, [subregions, region, theme, wbBase]);
 
   const clusterColor = region.color;
 

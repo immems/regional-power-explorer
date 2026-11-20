@@ -1,15 +1,36 @@
 {
+ "legend": [
+  {
+   "group": "Americas",
+   "regions": ["northamerica", "siepac", "andean", "mercosur"]
+  },
+  {
+   "group": "Africa and Middle East",
+   "regions": ["wapp", "capp", "eapp", "sapp", "easa", "panarab"]
+  },
+  {
+   "group": "Europe",
+   "regions": ["eu", "entsoe", "balkans", "blacksea"]
+  },
+  {
+   "group": "Asia",
+   "regions": ["centralasia", "casa", "southasia", "gms", "asean"]
+  },
+  {
+   "group": "Small island states",
+   "regions": ["sids"]
+  }
+ ],
  "regions": [
   {
    "id": "blacksea",
-   "epm": true,
    "name": "Black Sea",
    "status": "available",
-   "color": "#1E6DB8",
+   "color": "#54B4EC",
    "countries": [
     {
      "iso": "TUR",
-     "name": "Turkiye"
+     "name": "Türkiye"
     },
     {
      "iso": "ROU",
@@ -37,7 +58,7 @@
    "id": "wapp",
    "name": "Western Africa Power Pool",
    "status": "available",
-   "color": "#C47C2A",
+   "color": "#C2925B",
    "countries": [
     {
      "iso": "SEN",
@@ -45,7 +66,7 @@
     },
     {
      "iso": "GMB",
-     "name": "Gambia"
+     "name": "The Gambia"
     },
     {
      "iso": "GNB",
@@ -65,7 +86,7 @@
     },
     {
      "iso": "CIV",
-     "name": "Cote d'Ivoire"
+     "name": "Côte d'Ivoire"
     },
     {
      "iso": "GHA",
@@ -94,14 +115,6 @@
     {
      "iso": "BFA",
      "name": "Burkina Faso"
-    },
-    {
-     "iso": "MRT",
-     "name": "Mauritania"
-    },
-    {
-     "iso": "CPV",
-     "name": "Cape Verde"
     }
    ]
   },
@@ -109,7 +122,7 @@
    "id": "capp",
    "name": "Central Africa Power Pool",
    "status": "available",
-   "color": "#2A88C8",
+   "color": "#636039",
    "countries": [
     {
      "iso": "CMR",
@@ -125,7 +138,7 @@
     },
     {
      "iso": "COD",
-     "name": "DR Congo"
+     "name": "Democratic Republic of Congo"
     },
     {
      "iso": "COG",
@@ -141,21 +154,25 @@
     },
     {
      "iso": "STP",
-     "name": "Sao Tome and Principe"
+     "name": "São Tomé and Príncipe"
     }
    ]
   },
   {
    "id": "eapp",
    "epm": true,
-   "non_determined": ["Abyei"],
+   "non_determined": [
+    "Abyei",
+    "Ilemi Triangle"
+   ],
    "name": "Eastern Africa Power Pool",
    "status": "available",
-   "color": "#1AA8B0",
+   "color": "#D4A26A",
    "countries": [
     {
      "iso": "EGY",
-     "name": "Egypt"
+     "name": "Arab Republic of Egypt",
+     "epm_name": "Egypt"
     },
     {
      "iso": "LBY",
@@ -187,7 +204,8 @@
     },
     {
      "iso": "SOM",
-     "name": "Somalia"
+     "name": "Federal Republic of Somalia",
+     "epm_name": "Somalia"
     },
     {
      "iso": "UGA",
@@ -203,7 +221,8 @@
     },
     {
      "iso": "COD",
-     "name": "DR Congo"
+     "name": "Democratic Republic of Congo",
+     "epm_name": "DR Congo"
     }
    ]
   },
@@ -212,7 +231,7 @@
    "epm": true,
    "name": "Southern Africa Power Pool",
    "status": "available",
-   "color": "#6098D0",
+   "color": "#938E49",
    "countries": [
     {
      "iso": "ZAF",
@@ -251,10 +270,6 @@
      "name": "Eswatini"
     },
     {
-     "iso": "MDG",
-     "name": "Madagascar"
-    },
-    {
      "iso": "AGO",
      "name": "Angola"
     },
@@ -264,20 +279,24 @@
     },
     {
      "iso": "COD",
-     "name": "DR Congo"
+     "name": "Democratic Republic of Congo",
+     "epm_name": "DR Congo"
     }
    ]
   },
   {
    "id": "easa",
-   "non_determined": ["Abyei"],
+   "non_determined": [
+    "Abyei",
+    "Ilemi Triangle"
+   ],
    "name": "EA & SA Pools",
    "status": "available",
-   "color": "#5A6FC0",
+   "color": "#846849",
    "countries": [
     {
      "iso": "EGY",
-     "name": "Egypt"
+     "name": "Arab Republic of Egypt"
     },
     {
      "iso": "LBY",
@@ -309,7 +328,7 @@
     },
     {
      "iso": "SOM",
-     "name": "Somalia"
+     "name": "Federal Republic of Somalia"
     },
     {
      "iso": "UGA",
@@ -325,7 +344,7 @@
     },
     {
      "iso": "COD",
-     "name": "DR Congo"
+     "name": "Democratic Republic of Congo"
     },
     {
      "iso": "ZAF",
@@ -375,10 +394,16 @@
   },
   {
    "id": "panarab",
-   "non_determined": ["Western Sahara"],
+   "non_determined": [
+    "Abyei",
+    "Golan Heights",
+    "No Man's Land",
+    "Shebaa Farms Dispute",
+    "Western Sahara"
+   ],
    "name": "Pan-Arab",
    "status": "available",
-   "color": "#C4A020",
+   "color": "#827D55",
    "countries": [
     {
      "iso": "MAR",
@@ -398,7 +423,7 @@
     },
     {
      "iso": "EGY",
-     "name": "Egypt"
+     "name": "Arab Republic of Egypt"
     },
     {
      "iso": "JOR",
@@ -410,7 +435,7 @@
     },
     {
      "iso": "SYR",
-     "name": "Syria"
+     "name": "Syrian Arab Republic"
     },
     {
      "iso": "IRQ",
@@ -422,7 +447,7 @@
     },
     {
      "iso": "YEM",
-     "name": "Yemen"
+     "name": "Republic of Yemen"
     },
     {
      "iso": "OMN",
@@ -430,7 +455,7 @@
     },
     {
      "iso": "ARE",
-     "name": "UAE"
+     "name": "United Arab Emirates"
     },
     {
      "iso": "QAT",
@@ -446,7 +471,11 @@
     },
     {
      "iso": "PSE",
-     "name": "Palestine"
+     "name": "West Bank and Gaza"
+    },
+    {
+     "iso": "SDN",
+     "name": "Sudan"
     }
    ]
   },
@@ -454,7 +483,7 @@
    "id": "balkans",
    "name": "Western Balkans 6",
    "status": "available",
-   "color": "#3A6098",
+   "color": "#7A77B9",
    "countries": [
     {
      "iso": "ALB",
@@ -484,10 +513,24 @@
   },
   {
    "id": "southasia",
-   "non_determined": ["Arunchal Pradesh", "Disputed Area: IND/PAK"],
+   "non_determined": [
+    "Aksai Chin",
+    "Arunachal Pradesh",
+    "Chumar East",
+    "Chumar West",
+    "Demchok",
+    "Doklam",
+    "Jadh Ganga Valley",
+    "Jammu and Kashmir",
+    "Kalapani",
+    "Karakoram Range",
+    "Kauirik",
+    "Lapthal",
+    "Shipki Pass"
+   ],
    "name": "South Asia",
    "status": "available",
-   "color": "#1A8AAA",
+   "color": "#236A52",
    "countries": [
     {
      "iso": "IND",
@@ -527,7 +570,7 @@
    "id": "centralasia",
    "name": "Central Asia",
    "status": "available",
-   "color": "#2A4E8E",
+   "color": "#46BDA9",
    "countries": [
     {
      "iso": "KAZ",
@@ -535,7 +578,7 @@
     },
     {
      "iso": "KGZ",
-     "name": "Kyrgyzstan"
+     "name": "Kyrgyz Republic"
     },
     {
      "iso": "TJK",
@@ -556,7 +599,8 @@
    "epm": true,
    "name": "Central Asia - South Asia (CASA)",
    "status": "available",
-   "color": "#7A5AA8",
+   "color": "#44989A",
+   "grid_note": "The CASA-1000 project itself connects four countries: the Kyrgyz Republic and Tajikistan as exporters, Afghanistan and Pakistan as importers. The seven listed here are the wider Central Asia to South Asia corridor, which is the perimeter this map draws.",
    "countries": [
     {
      "iso": "KAZ",
@@ -564,7 +608,8 @@
     },
     {
      "iso": "KGZ",
-     "name": "Kyrgyzstan"
+     "name": "Kyrgyz Republic",
+     "epm_name": "Kyrgyzstan"
     },
     {
      "iso": "TJK",
@@ -586,17 +631,20 @@
      "iso": "PAK",
      "name": "Pakistan"
     }
+   ],
+   "non_determined": [
+    "Jammu and Kashmir"
    ]
   },
   {
    "id": "asean",
    "name": "ASEAN Power Grid",
    "status": "available",
-   "color": "#1A9080",
+   "color": "#23ACAE",
    "countries": [
     {
      "iso": "BRN",
-     "name": "Brunei"
+     "name": "Brunei Darussalam"
     },
     {
      "iso": "KHM",
@@ -608,7 +656,7 @@
     },
     {
      "iso": "LAO",
-     "name": "Laos"
+     "name": "Lao People's Democratic Republic"
     },
     {
      "iso": "MYS",
@@ -632,7 +680,57 @@
     },
     {
      "iso": "VNM",
-     "name": "Vietnam"
+     "name": "Viet Nam"
+    }
+   ]
+  },
+  {
+   "id": "gms",
+   "name": "Greater Mekong Subregion (GMS)",
+   "status": "available",
+   "color": "#258A7C",
+   "grid_note": "The GMS as ADB defines it also covers Yunnan and Guangxi. The pipeline works at country level and cannot cut a Chinese province, so the two provinces are absent here. Read the northern edge of the map as a boundary of this dataset, not of the interconnection.",
+   "countries": [
+    {
+     "iso": "KHM",
+     "name": "Cambodia"
+    },
+    {
+     "iso": "LAO",
+     "name": "Lao People's Democratic Republic"
+    },
+    {
+     "iso": "MMR",
+     "name": "Myanmar"
+    },
+    {
+     "iso": "THA",
+     "name": "Thailand"
+    },
+    {
+     "iso": "VNM",
+     "name": "Viet Nam"
+    }
+   ]
+  },
+  {
+   "id": "northamerica",
+   "name": "North America",
+   "status": "available",
+   "color": "#7E92D5",
+   "grid_note": "Mapped at 220 kV and above, so the map shows the 230, 345, 500 and 765 kV bulk network. The 115 kV and 138 kV systems, which carry a large share of regional transfers in North America, are not drawn. Showing them would quadruple the layer and make the continental view unreadable.",
+   "countries": [
+    {
+     "iso": "CAN",
+     "name": "Canada"
+    },
+    {
+     "iso": "USA",
+     "name": "United States of America"
+    },
+    {
+     "iso": "MEX",
+     "name": "Mexico"
     }
    ]
   },
@@ -640,7 +738,7 @@
    "id": "siepac",
    "name": "SIEPAC",
    "status": "available",
-   "color": "#3A9040",
+   "color": "#00709C",
    "countries": [
     {
      "iso": "GTM",
@@ -669,11 +767,71 @@
    ]
   },
   {
+   "id": "mercosur",
+   "name": "Southern Cone (MERCOSUR)",
+   "status": "available",
+   "color": "#717097",
+   "grid_note": "OpenStreetMap coverage is thin in South America. The transmission layer shows a fraction of the real network, so gaps on the map are missing data, not missing lines.",
+   "countries": [
+    {
+     "iso": "ARG",
+     "name": "Argentina"
+    },
+    {
+     "iso": "BRA",
+     "name": "Brazil"
+    },
+    {
+     "iso": "CHL",
+     "name": "Chile"
+    },
+    {
+     "iso": "PRY",
+     "name": "Paraguay"
+    },
+    {
+     "iso": "URY",
+     "name": "Uruguay"
+    }
+   ]
+  },
+  {
+   "id": "andean",
+   "name": "Andean Community",
+   "status": "available",
+   "color": "#68A4E3",
+   "grid_note": "OpenStreetMap coverage is thin in South America. The transmission layer shows a fraction of the real network, so gaps on the map are missing data, not missing lines.",
+   "countries": [
+    {
+     "iso": "BOL",
+     "name": "Bolivia"
+    },
+    {
+     "iso": "COL",
+     "name": "Colombia"
+    },
+    {
+     "iso": "ECU",
+     "name": "Ecuador"
+    },
+    {
+     "iso": "PER",
+     "name": "Peru"
+    },
+    {
+     "iso": "VEN",
+     "name": "Republica Bolivariana de Venezuela"
+    }
+   ]
+  },
+  {
    "id": "eu",
-   "non_determined": ["UN Buffer Zone in Cyprus"],
+   "non_determined": [
+    "UN Buffer Zone"
+   ],
    "name": "European Union",
    "status": "available",
-   "color": "#4870C0",
+   "color": "#00639B",
    "countries": [
     {
      "iso": "AUT",
@@ -697,7 +855,7 @@
     },
     {
      "iso": "CZE",
-     "name": "Czechia"
+     "name": "Czech Republic"
     },
     {
      "iso": "DNK",
@@ -769,7 +927,7 @@
     },
     {
      "iso": "SVK",
-     "name": "Slovakia"
+     "name": "Slovak Republic"
     },
     {
      "iso": "SVN",
@@ -790,7 +948,7 @@
    "name": "SIDS",
    "type": "meta",
    "status": "available",
-   "color": "#0E9B8A",
+   "color": "#007A7C",
    "subregions": [
     "sids-caribbean",
     "sids-pacific",
@@ -823,7 +981,7 @@
     },
     {
      "iso": "BHS",
-     "name": "Bahamas"
+     "name": "The Bahamas"
     },
     {
      "iso": "GRD",
@@ -895,7 +1053,7 @@
     },
     {
      "iso": "NRU",
-     "name": "Nauru"
+     "name": "Naoero"
     },
     {
      "iso": "PLW",
@@ -907,7 +1065,7 @@
     },
     {
      "iso": "FSM",
-     "name": "Micronesia"
+     "name": "Federated States of Micronesia"
     },
     {
      "iso": "TLS",
@@ -931,11 +1089,11 @@
     },
     {
      "iso": "STP",
-     "name": "Sao Tome and Principe"
+     "name": "São Tomé and Príncipe"
     },
     {
      "iso": "CPV",
-     "name": "Cape Verde"
+     "name": "Cabo Verde"
     },
     {
      "iso": "GNB",
@@ -957,7 +1115,7 @@
    "type": "sub",
    "parent": "sids",
    "status": "available",
-   "color": "#0E9B8A",
+   "color": "#007A7C",
    "center": [
     -64,
     14
@@ -989,7 +1147,7 @@
     },
     {
      "iso": "BHS",
-     "name": "Bahamas"
+     "name": "The Bahamas"
     },
     {
      "iso": "GRD",
@@ -1035,7 +1193,7 @@
    "type": "sub",
    "parent": "sids",
    "status": "available",
-   "color": "#0E9B8A",
+   "color": "#007A7C",
    "center": [
     168,
     -10
@@ -1075,7 +1233,7 @@
     },
     {
      "iso": "NRU",
-     "name": "Nauru"
+     "name": "Naoero"
     },
     {
      "iso": "PLW",
@@ -1087,7 +1245,7 @@
     },
     {
      "iso": "FSM",
-     "name": "Micronesia"
+     "name": "Federated States of Micronesia"
     },
     {
      "iso": "TLS",
@@ -1101,7 +1259,7 @@
    "type": "sub",
    "parent": "sids",
    "status": "available",
-   "color": "#0E9B8A",
+   "color": "#007A7C",
    "center": [
     62,
     -12
@@ -1125,11 +1283,11 @@
     },
     {
      "iso": "STP",
-     "name": "Sao Tome and Principe"
+     "name": "São Tomé and Príncipe"
     },
     {
      "iso": "CPV",
-     "name": "Cape Verde"
+     "name": "Cabo Verde"
     },
     {
      "iso": "GNB",
@@ -1142,6 +1300,170 @@
     {
      "iso": "BHR",
      "name": "Bahrain"
+    }
+   ],
+   "non_determined": [
+    "British Indian Ocean Territory"
+   ]
+  },
+  {
+   "id": "entsoe",
+   "name": "ENTSO-E (pan-European)",
+   "status": "available",
+   "color": "#3591C3",
+   "grid_note": "Pan-European synchronous and market perimeter, wider than the EU-27. Mapped at 220 kV and above to keep the layer usable at continental scale, so sub-transmission is not shown.",
+   "countries": [
+    {
+     "iso": "ALB",
+     "name": "Albania"
+    },
+    {
+     "iso": "AUT",
+     "name": "Austria"
+    },
+    {
+     "iso": "BEL",
+     "name": "Belgium"
+    },
+    {
+     "iso": "BIH",
+     "name": "Bosnia and Herzegovina"
+    },
+    {
+     "iso": "BGR",
+     "name": "Bulgaria"
+    },
+    {
+     "iso": "HRV",
+     "name": "Croatia"
+    },
+    {
+     "iso": "CYP",
+     "name": "Cyprus"
+    },
+    {
+     "iso": "CZE",
+     "name": "Czech Republic"
+    },
+    {
+     "iso": "DNK",
+     "name": "Denmark"
+    },
+    {
+     "iso": "EST",
+     "name": "Estonia"
+    },
+    {
+     "iso": "FIN",
+     "name": "Finland"
+    },
+    {
+     "iso": "FRA",
+     "name": "France"
+    },
+    {
+     "iso": "DEU",
+     "name": "Germany"
+    },
+    {
+     "iso": "GRC",
+     "name": "Greece"
+    },
+    {
+     "iso": "HUN",
+     "name": "Hungary"
+    },
+    {
+     "iso": "ISL",
+     "name": "Iceland"
+    },
+    {
+     "iso": "IRL",
+     "name": "Ireland"
+    },
+    {
+     "iso": "ITA",
+     "name": "Italy"
+    },
+    {
+     "iso": "LVA",
+     "name": "Latvia"
+    },
+    {
+     "iso": "LTU",
+     "name": "Lithuania"
+    },
+    {
+     "iso": "LUX",
+     "name": "Luxembourg"
+    },
+    {
+     "iso": "MDA",
+     "name": "Moldova"
+    },
+    {
+     "iso": "MNE",
+     "name": "Montenegro"
+    },
+    {
+     "iso": "NLD",
+     "name": "Netherlands"
+    },
+    {
+     "iso": "MKD",
+     "name": "North Macedonia"
+    },
+    {
+     "iso": "NOR",
+     "name": "Norway"
+    },
+    {
+     "iso": "POL",
+     "name": "Poland"
+    },
+    {
+     "iso": "PRT",
+     "name": "Portugal"
+    },
+    {
+     "iso": "ROU",
+     "name": "Romania"
+    },
+    {
+     "iso": "SRB",
+     "name": "Serbia"
+    },
+    {
+     "iso": "SVK",
+     "name": "Slovak Republic"
+    },
+    {
+     "iso": "SVN",
+     "name": "Slovenia"
+    },
+    {
+     "iso": "ESP",
+     "name": "Spain"
+    },
+    {
+     "iso": "SWE",
+     "name": "Sweden"
+    },
+    {
+     "iso": "CHE",
+     "name": "Switzerland"
+    },
+    {
+     "iso": "TUR",
+     "name": "Türkiye"
+    },
+    {
+     "iso": "UKR",
+     "name": "Ukraine"
+    },
+    {
+     "iso": "GBR",
+     "name": "United Kingdom"
     }
    ]
   }

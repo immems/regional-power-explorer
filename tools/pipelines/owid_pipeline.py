@@ -43,7 +43,9 @@ OWID_FUEL_MAP = {
     'wind_electricity':             'Wind',
     'oil_electricity':              'Oil',
     'biofuel_electricity':          'Bioenergy',
-    'other_renewable_electricity':  'Other Renewables',
+    # Not other_renewable_electricity: that one includes bioenergy, which is
+    # already counted above, so bioenergy came out twice.
+    'other_renewable_exc_biofuel_electricity': 'Other Renewables',
 }
 
 # Countries to process by default — add any ISO3 here
@@ -184,6 +186,25 @@ DEFAULT_COUNTRIES: dict[str, str] = {
     'NPL': 'Nepal',
     'BTN': 'Bhutan',
     'AFG': 'Afghanistan',
+    # Southern Cone (MERCOSUR)
+    'ARG': 'Argentina',
+    'BRA': 'Brazil',
+    'CHL': 'Chile',
+    'PRY': 'Paraguay',
+    'URY': 'Uruguay',
+    # Andean Community
+    'BOL': 'Bolivia',
+    'COL': 'Colombia',
+    'ECU': 'Ecuador',
+    'PER': 'Peru',
+    'VEN': 'Venezuela',
+    # ENTSO-E members missing from the list above
+    'ISL': 'Iceland',
+    'MDA': 'Moldova',
+    # North America
+    'USA': 'United States',
+    'CAN': 'Canada',
+    'MEX': 'Mexico',
 }
 
 

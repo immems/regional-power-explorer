@@ -1,9 +1,23 @@
+import { dataPath } from '../utils/paths';
+import { fetchData } from '../utils/dataCache';
 import { useEffect, useRef, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { track } from '../analytics';
 import maplibregl from 'maplibre-gl';
 import { useTheme } from '../App';
-import { getT, mapStyle } from '../constants';
-import { fetchCountries, fetchBoundaries, addCountriesSource, addBaseLayers, regionFilter, addRegionCoast, raiseBoundaries } from '../utils/basemap';
+import { getT } from '../constants';
+import { buildWbStyle, useWbStyleBase } from '../utils/wbStyle';
+import MapChat from '../chat/LazyMapChat';
+import ExportControl from '../components/ExportControl';
+import { prefetchPages } from './lazyPages';
+import { regionGroups } from '../utils/regionOrder';
+import { fetchBboxes, fetchNdlsa, prefetchGeo, addGeoSource, geoDetail, countryLayer, featureTarget, isArea, areaName, isNamed, nameHtml, isItalicName, regionFilter, addNdlsaLayer, raiseBoundaries, fillAnchor } from '../utils/basemap';
+
+// The world map's last view, kept for the visit: the page builds a new map each
+// time it opens and on every theme switch, and coming back from a region (or
+// clicking the title) should find the map where it was left, not at the start.
+// A reload starts from the default again.
+let lastView = { center: [20, 15], zoom: 2.2 };
 
 export default function WorldPage() {
   const { theme } = useTheme();
@@ -14,6 +28,9 @@ export default function WorldPage() {
   const metaMarkersRef = useRef([]);
   const metaActiveRef = useRef(null);
   const [regions, setRegions] = useState(null);
+  const [legend, setLegend] = useState(null);
+  const [mapReady, setMapReady] = useState(false);
+  const wbBase = useWbStyleBase();
   const [metaActive, setMetaActive] = useState(null); // region obj or null
   const [disambig, setDisambig] = useState(null);
   const [isMobile, setIsMobile] = useState(() => window.innerWidth < 700);
@@ -25,8 +42,13 @@ export default function WorldPage() {
   }, []);
 
   useEffect(() => {
-    fetch('/data/regions.json').then(r => r.json()).then(d => setRegions(d.regions));
+    prefetchGeo('world');
+    fetchBboxes().catch(() => {}); // so a click frames the region at once
+    fetchData(dataPath('regions.json')).then(d => { setRegions(d.regions); setLegend(d.legend); });
   }, []);
+
+  // Once the world map has drawn, fetch the region and country page code.
+  useEffect(() => { if (mapReady) prefetchPages(); }, [mapReady]);
 
   // --- Cluster marker helpers ---
   function buildClusterEl(sub, meta) {
@@ -100,11 +122,11 @@ export default function WorldPage() {
 
   // Main map effect
   useEffect(() => {
-    if (!containerRef.current || !regions) return;
+    if (!containerRef.current || !regions || !wbBase) return;
 
     const isoToRegions = {};
     // Areas the Bank attributes to no country carry no code, so they are keyed
-    // on WB_NAME instead. See regionFilter() in src/utils/basemap.js.
+    // on WB_NAME instead. See regions.json `non_determined`.
     const areaToRegions = {};
     const available = regions.filter(r => r.status === 'available');
     for (const r of available) {
@@ -119,112 +141,110 @@ export default function WorldPage() {
       }
     }
     const availableIsos = Object.keys(isoToRegions);
-    const availableAreas = Object.keys(areaToRegions);
-    const regionsFor = p =>
-      (p.STATUS === 'non-determined' ? areaToRegions[p.WB_NAME] : isoToRegions[p.ISO_A3]) || [];
+    const regionsFor = f =>
+      (isArea(f) ? areaToRegions[areaName(f)] : isoToRegions[f.properties.ISO_A3]) || [];
+    // A country's colour on this map is its first region's.
+    const colorForIso = iso => isoToRegions[iso]?.[0].color || null;
 
+    let disposed = false;
     const map = new maplibregl.Map({
       container: containerRef.current,
-      style: mapStyle(theme),
-      center: [20, 15],
-      zoom: 2.2,
+      style: buildWbStyle(wbBase, t),
+      center: lastView.center,
+      zoom: lastView.zoom,
       minZoom: 1.5,
       maxZoom: 9,
       attributionControl: false,
     });
     mapRef.current = map;
+    map.on('moveend', () => {
+      const c = map.getCenter();
+      lastView = { center: [c.lng, c.lat], zoom: map.getZoom() };
+    });
 
     map.on('movestart', () => setDisambig(null));
 
-    map.on('load', async () => {
-      const countries = await fetchCountries('110m');
-      const boundaries = await fetchBoundaries('110m');
+    // On the style, not 'load': 'load' waits for every basemap tile and font
+    // to arrive and draw, and the region colours have no reason to wait for them.
+    map.once('style.load', async () => {
+      const [ndlsa, mode] = await Promise.all([
+        fetchNdlsa(),
+        addGeoSource(map, 'world', undefined, () => disposed),
+      ]);
+      if (!mode) return;
 
-      addCountriesSource(map, countries);
-      addBaseLayers(map, t, boundaries);
 
       if (availableIsos.length) {
-        const byIso = ['match', ['get', 'ISO_A3'],
+        const colorExpr = ['match', ['get', 'ISO_A3'],
           ...availableIsos.flatMap(iso => [iso, isoToRegions[iso][0].color]),
           'transparent',
         ];
-        const colorExpr = availableAreas.length
-          ? ['case', ['==', ['get', 'STATUS'], 'non-determined'],
-              ['match', ['get', 'WB_NAME'],
-                ...availableAreas.flatMap(a => [a, areaToRegions[a][0].color]),
-                'transparent'],
-              byIso]
-          : byIso;
         map.addLayer({
           id: 'region-fill',
           type: 'fill',
-          source: 'countries',
-          filter: regionFilter(availableIsos, availableAreas),
+          ...countryLayer(mode),
+          filter: regionFilter(availableIsos),
           paint: {
             'fill-color': colorExpr,
-            'fill-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.55, 0.28],
+            'fill-opacity': ['case', ['boolean', ['feature-state', 'hover'], false], 0.65, 0.4],
           },
-        });
-        map.addLayer({
-          id: 'region-border',
-          type: 'line',
-          source: 'countries',
-          filter: ['in', ['get', 'ISO_A3'], ['literal', availableIsos]],
-          paint: { 'line-color': colorExpr, 'line-width': 0.9, 'line-opacity': 0.7 },
-        });
-
-        // The areas take the same outline, keyed on the only name they carry.
-        addRegionCoast(map, {
-          areas: availableAreas,
-          color: ['match', ['get', 'NAME'],
-            ...availableAreas.flatMap(a => [a, areaToRegions[a][0].color]),
-            'transparent'],
-          width: 0.9, opacity: 0.7,
-        });
+        }, fillAnchor(map));
       }
+      // Every non-determined area, coloured from its parties; the basemap
+      // draws their outlines. Under the region fill so a hovered country
+      // never looks cut by its neighbour's area.
+      addNdlsaLayer(map, { ndlsa, colorForIso, opacity: 0.28, hoverOpacity: 0.55, before: fillAnchor(map), t, mode });
 
       let hoveredId = null;
       const popup = new maplibregl.Popup({
         closeButton: false, closeOnClick: false, offset: 8,
         className: `popup-${theme}`,
       });
+      const hoverLayers = ['region-fill', 'ndlsa-fill'];
 
-      map.on('mousemove', 'region-fill', e => {
+      map.on('mousemove', hoverLayers, e => {
         map.getCanvas().style.cursor = 'pointer';
         if (hoveredId !== null)
-          map.setFeatureState({ source: 'countries', id: hoveredId }, { hover: false });
-        hoveredId = e.features[0].id;
-        map.setFeatureState({ source: 'countries', id: hoveredId }, { hover: true });
+          map.setFeatureState(hoveredId, { hover: false });
+        hoveredId = featureTarget(e.features[0]);
+        map.setFeatureState(hoveredId, { hover: true });
 
-        const props = e.features[0].properties;
-        const rs = regionsFor(props);
-        const countryName = rs[0]?.countryName || props.WB_NAME || props.ISO_A3;
+        const f = e.features[0];
+        if (!isNamed(f)) { popup.remove(); return; }
+        const rs = regionsFor(f);
+        if (rs.length === 0) { popup.remove(); return; }
+        // The polygon's own Bank name, not regions.json's: the popup names what the map draws.
+        const countryName = areaName(f) || rs[0]?.countryName || f.properties.ISO_A3;
+        // Each region with its map colour, as the click chooser draws it.
+        const swatch = r => `<span style="display:inline-block;width:8px;height:8px;border-radius:2px;background:${r.color};margin-right:5px"></span>${r.name}`;
         const subtitle = rs.length > 1
-          ? rs.map(r => r.name).join(' · ') + ' · click to choose'
-          : (rs[0]?.name || '') + ' · click to explore';
+          ? rs.map(swatch).join('<br>') + '<br><span style="opacity:0.65">Click to choose</span>'
+          : swatch(rs[0]) + ' <span style="opacity:0.65">· click to explore</span>';
         popup.setLngLat(e.lngLat)
-          .setHTML(`<b>${countryName}</b><br><span style="opacity:0.65">${subtitle}</span>`)
+          .setHTML(`<b>${nameHtml(countryName)}</b><br>${subtitle}`)
           .addTo(map);
       });
 
-      map.on('mouseleave', 'region-fill', () => {
+      map.on('mouseleave', hoverLayers, () => {
         map.getCanvas().style.cursor = '';
         if (hoveredId !== null)
-          map.setFeatureState({ source: 'countries', id: hoveredId }, { hover: false });
+          map.setFeatureState(hoveredId, { hover: false });
         hoveredId = null;
         popup.remove();
       });
 
-      map.on('click', 'region-fill', e => {
-        const props = e.features[0].properties;
-        const iso = props.ISO_A3 || props.WB_NAME;
-        const rs = regionsFor(props);
+      map.on('click', hoverLayers, e => {
+        const f = e.features[0];
+        const iso = f.properties.ISO_A3 || areaName(f);
+        const rs = regionsFor(f);
+        const name = isNamed(f) ? areaName(f) || rs[0]?.countryName : null;
         if (rs.length === 0) return;
+        track('map_feature_click', { kind: 'country', iso, region: rs.length === 1 ? rs[0].id : undefined });
         if (rs.length === 1) {
           navigate(`/region/${rs[0].id}`);
         } else {
           const pixel = map.project(e.lngLat);
-          setDisambig({ x: pixel.x, y: pixel.y, iso, regions: rs });
+          setDisambig({ x: pixel.x, y: pixel.y, iso, name, regions: rs });
         }
       });
 
@@ -232,30 +252,37 @@ export default function WorldPage() {
 
       // Restore meta markers after map rebuild (e.g., theme change)
       if (metaActiveRef.current) applyMetaMarkers(metaActiveRef.current, map);
+
+      // The export and the chat read the source's data, so they wait for the
+      // full geometry to replace the first pass.
+      await geoDetail(map);
+      if (!disposed) setMapReady(true);
     });
 
     return () => {
+      disposed = true;
       metaMarkersRef.current = []; // map.remove() detaches them
       mapRef.current?.remove();
+      mapRef.current = null;
+      setMapReady(false);
       setDisambig(null);
     };
-  }, [regions, theme]);
+  }, [regions, theme, wbBase]);
 
-  // Build flattened legend items (main regions + sub-regions when meta is active)
-  const legendItems = regions
-    ? regions.flatMap(r => {
-        if (r.type === 'sub') return [];
-        const items = [r];
-        if (r.type === 'meta' && metaActive?.id === r.id) {
-          items.push(...regions.filter(s => s.parent === r.id));
-        }
-        return items;
-      })
-    : [];
+  // The legend lists regions by geography, as regions.json `legend` lays them
+  // out; a meta-region unfolds its sub-regions under it while active.
+  const legendGroups = regionGroups(regions, legend).map(g => ({
+    ...g,
+    items: g.regions.flatMap(r =>
+      r.type === 'meta' && metaActive?.id === r.id
+        ? [r, ...regions.filter(s => s.parent === r.id)]
+        : [r]),
+  }));
 
   return (
     <div style={{ height: 'calc(100vh - 46px)', position: 'relative', backgroundColor: t.bg }}>
       <div ref={containerRef} style={{ width: '100%', height: '100%' }} />
+      <MapChat theme={theme} mapRef={mapRef} ready={mapReady} controller={{ page: 'world', navigate }} />
 
       {/* Disambiguation popover */}
       {disambig && (
@@ -279,13 +306,19 @@ export default function WorldPage() {
           }}>
             <div style={{ fontSize: '0.5rem', letterSpacing: '2px', fontWeight: 700,
               color: t.lblMuted, textTransform: 'uppercase', marginBottom: 8 }}>
-              {disambig.regions[0]?.countryName || disambig.iso} · Choose region
+              <span style={isItalicName(disambig.name) ? { fontStyle: 'italic' } : undefined}>
+                {disambig.name}
+              </span>{disambig.name ? ' · ' : ''}Choose region
             </div>
             <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
               {disambig.regions.map(r => (
                 <button
                   key={r.id}
-                  onClick={e => { e.stopPropagation(); setDisambig(null); navigate(`/region/${r.id}`); }}
+                  onClick={e => {
+                    e.stopPropagation(); setDisambig(null);
+                    track('map_feature_click', { kind: 'region', region: r.id, iso: disambig.iso });
+                    navigate(`/region/${r.id}`);
+                  }}
                   style={{
                     display: 'flex', alignItems: 'center', gap: 8,
                     background: 'none', border: `1px solid ${r.color}44`,
@@ -309,57 +342,72 @@ export default function WorldPage() {
       {/* Region legend */}
       {regions && !isMobile && (
         <div style={{
-          position: 'absolute', bottom: 70, left: 24,
+          position: 'absolute', top: '50%', left: 24,
+          transform: 'translateY(-50%)',
+          maxHeight: 'calc(100vh - 46px - 48px)',
           backgroundColor: t.panel, border: `1px solid ${t.panelBorder}`,
           borderRadius: 8, padding: '12px 14px',
           display: 'flex', flexDirection: 'column', gap: 7,
         }}>
           <div style={{ fontSize: '0.52rem', letterSpacing: '2px', fontWeight: 700,
             color: t.lblMuted, textTransform: 'uppercase', marginBottom: 2 }}>
-            Power Pools & Regions
+            Regional initiatives
           </div>
-          {legendItems.map(r => {
-            const isSub = r.type === 'sub';
-            const isMeta = r.type === 'meta';
-            const isActive = isMeta && metaActive?.id === r.id;
-            return (
-              <div
-                key={r.id}
-                onClick={() => {
-                  if (isMeta) { handleMetaToggle(r); return; }
-                  if (r.status === 'available') navigate(`/region/${r.id}`);
-                }}
-                style={{
-                  display: 'flex', alignItems: 'center', gap: 8,
-                  paddingLeft: isSub ? 14 : 0,
-                  cursor: r.status === 'available' ? 'pointer' : 'default',
-                  opacity: r.status === 'available' ? 1 : 0.38,
-                }}
-              >
-                <span style={{
-                  width: isSub ? 6 : 9,
-                  height: isSub ? 6 : 9,
-                  borderRadius: (isMeta || isSub) ? '50%' : 2,
-                  backgroundColor: r.color,
-                  flexShrink: 0,
-                }} />
-                <span style={{ fontSize: isSub ? '0.68rem' : '0.75rem', color: isSub ? t.muted : t.text }}>
-                  {r.name}
-                </span>
-                {isMeta && (
-                  <span style={{ marginLeft: 'auto', fontSize: '0.58rem', color: t.muted, paddingLeft: 4 }}>
-                    {isActive ? '▲' : '▼'}
-                  </span>
-                )}
-                {!isMeta && !isSub && r.status !== 'available' && (
-                  <span style={{ fontSize: '0.58rem', color: t.lblMuted }}>soon</span>
-                )}
-                {isSub && (
-                  <span style={{ marginLeft: 'auto', fontSize: '0.55rem', color: t.muted }}>→</span>
-                )}
-              </div>
-            );
-          })}
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 7,
+            overflowY: 'auto', minHeight: 0, marginRight: -6, paddingRight: 6 }}>
+          {legendGroups.map((g, gi) => (
+            <div key={g.label || 'other'} style={{ display: 'flex', flexDirection: 'column', gap: 7 }}>
+              {g.label && (
+                <div style={{ fontSize: '0.46rem', letterSpacing: '1.5px', fontWeight: 700,
+                  color: t.lblMuted, textTransform: 'uppercase', marginTop: gi ? 5 : 0 }}>
+                  {g.label}
+                </div>
+              )}
+              {g.items.map(r => {
+                const isSub = r.type === 'sub';
+                const isMeta = r.type === 'meta';
+                const isActive = isMeta && metaActive?.id === r.id;
+                return (
+                  <div
+                    key={r.id}
+                    onClick={() => {
+                      if (isMeta) { handleMetaToggle(r); return; }
+                      if (r.status === 'available') navigate(`/region/${r.id}`);
+                    }}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      paddingLeft: isSub ? 14 : 0,
+                      cursor: r.status === 'available' ? 'pointer' : 'default',
+                      opacity: r.status === 'available' ? 1 : 0.38,
+                    }}
+                  >
+                    <span style={{
+                      width: isSub ? 6 : 9,
+                      height: isSub ? 6 : 9,
+                      borderRadius: (isMeta || isSub) ? '50%' : 2,
+                      backgroundColor: r.color,
+                      flexShrink: 0,
+                    }} />
+                    <span style={{ fontSize: isSub ? '0.68rem' : '0.75rem', color: isSub ? t.muted : t.text }}>
+                      {r.name}
+                    </span>
+                    {isMeta && (
+                      <span style={{ marginLeft: 'auto', fontSize: '0.58rem', color: t.muted, paddingLeft: 4 }}>
+                        {isActive ? '▲' : '▼'}
+                      </span>
+                    )}
+                    {!isMeta && !isSub && r.status !== 'available' && (
+                      <span style={{ fontSize: '0.58rem', color: t.lblMuted }}>soon</span>
+                    )}
+                    {isSub && (
+                      <span style={{ marginLeft: 'auto', fontSize: '0.55rem', color: t.muted }}>→</span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          ))}
+          </div>
         </div>
       )}
 
@@ -387,6 +435,17 @@ export default function WorldPage() {
         </div>
       </div>
 
+      {/* Equal Earth export — under the hint */}
+      <ExportControl
+        mapRef={mapRef} ready={mapReady} t={t} compact={isMobile}
+        style={{ top: isMobile ? 62 : 52, right: 12 }}
+        title="Regional Power Explorer — power pools and regions"
+        fileName="regional-power-explorer-world"
+        legend={() => regionGroups(regions, legend).flatMap(g => g.regions)
+          .filter(r => r.status === 'available' && r.type !== 'meta')
+          .map(r => ({ color: r.color, alpha: 0.28, label: r.name }))}
+      />
+
       {/* ── Map disclaimer ── */}
       <div style={{
         position: 'absolute', bottom: 8, left: '50%', transform: 'translateX(-50%)',
@@ -396,8 +455,9 @@ export default function WorldPage() {
         fontSize: '0.47rem', color: t.lblMuted, textAlign: 'center',
         whiteSpace: 'nowrap', letterSpacing: '0.3px',
       }}>
-        Pilot · Indicative data · Partly AI-generated, not fact-checked · Boundaries for reference only · Unofficial
+        Pilot
       </div>
+
     </div>
   );
 }
